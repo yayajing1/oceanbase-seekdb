@@ -753,13 +753,21 @@ int ObSiliconflowUtils::ObSiliconflowRerank::parse_output(common::ObIAllocator &
                                                       common::ObIJsonBase *&result) 
 {
   int ret = OB_SUCCESS;
-  ObJsonArray *results_array = nullptr;
+  ObJsonNode *results_node = nullptr;
   if (OB_ISNULL(http_response)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ISNULL(results_array = static_cast<ObJsonArray *>(http_response->get_value("results")))) {
-    ret = OB_INVALID_DATA;
-  } else {
-    result = results_array;
+  } else if (OB_ISNULL(results_node = http_response->get_value("results"))) {
+    // some providers return the ranking results under the data key
+    if (OB_ISNULL(results_node = http_response->get_value("data"))) {
+      ret = OB_INVALID_DATA;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(results_node) || results_node->json_type() != ObJsonNodeType::J_ARRAY) {
+      ret = OB_INVALID_DATA;
+    } else {
+      result = static_cast<ObJsonArray *>(results_node);
+    }
   }
   return ret;
 }
