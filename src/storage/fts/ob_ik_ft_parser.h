@@ -34,16 +34,27 @@ class ObFTDictHub;
 class ObIKFTParser final : public ObITokenIterator
 {
 public:
-  ObIKFTParser(ObIAllocator &allocator, ObFTDictHub *hub)
-      : allocator_(allocator),
+  /**
+   * @param[in] scratch_alloc, the allocator of the per-document scratch
+   *            (the token containers). It is recycled after every document.
+   * @param[in] obj_alloc, the allocator of the objects which live as long as
+   *            the parser does (the tokenize context, the segmenters and the
+   *            pinned dictionaries).
+   * @param[in] hub, the global dictionary hub.
+   */
+  ObIKFTParser(ObIAllocator &scratch_alloc, ObIAllocator &obj_alloc, ObFTDictHub *hub)
+      : allocator_(scratch_alloc),
+        obj_alloc_(obj_alloc),
         is_inited_(false),
+        pooled_(false),
+        built_(false),
         coll_type_(ObCollationType::CS_TYPE_INVALID),
         ctx_(nullptr),
         hub_(hub),
-        segmenters_(allocator_),
-        cache_main_(allocator),
-        cache_quan_(allocator),
-        cache_stop_(allocator),
+        segmenters_(obj_alloc),
+        cache_main_(obj_alloc),
+        cache_quan_(obj_alloc),
+        cache_stop_(obj_alloc),
         dict_main_(nullptr),
         dict_quan_(nullptr),
         dict_stop_(nullptr)
@@ -53,6 +64,25 @@ public:
   virtual ~ObIKFTParser() { reset(); }
 
   int init(const ObFTParserParam &param);
+
+  /**
+   * Re-bind an already built parser to a new document. The dictionaries, the
+   * tokenize context and the segmenters are reused as they are, only the
+   * per-document state is re-applied, so that the produced tokens are exactly
+   * the ones of a freshly built parser.
+   */
+  int reuse_parser(const ObFTParserParam &param);
+
+  /**
+   * Drop the per-document state of the parser, so that it can be reused for
+   * the next document. The long-lived objects (the dictionaries, the context
+   * and the segmenters) are kept.
+   */
+  void release_to_pool();
+
+  bool is_built() const { return built_; }
+  bool is_pooled() const { return pooled_; }
+  void set_pooled() { pooled_ = true; }
 
   int get_next_token(const char *&word,
                      int64_t &word_len,
@@ -90,8 +120,16 @@ private:
 
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
+  // the per-document scratch
   ObIAllocator &allocator_;
+  // the storage of the objects which live as long as the parser does
+  ObIAllocator &obj_alloc_;
   bool is_inited_;
+  // the parser is owned by a per-thread pool and must not be destroyed by
+  // the caller of the parser descriptor
+  bool pooled_;
+  // the long-lived objects are built and usable
+  bool built_;
 
   ObCollationType coll_type_;
   TokenizeContext *ctx_;

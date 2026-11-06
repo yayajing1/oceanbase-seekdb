@@ -23,6 +23,44 @@ namespace oceanbase
 {
 namespace share
 {
+namespace
+{
+// The ASCII fast paths of the English tokenizer.
+//
+// Every ctype table of the server classifies the ASCII range exactly as the
+// standard C locale does, so the classification of an ASCII byte can be
+// computed without the charset table lookup. The helpers are only used for
+// the charsets whose minimum character length is one byte, so that a byte
+// below 0x80 is always a complete character.
+//
+// space, control or punctuation
+inline bool ascii_delimiter(const unsigned char c)
+{
+  return c <= 0x20 || (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40)
+         || (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E) || c == 0x7F;
+}
+
+inline bool ascii_alnum(const unsigned char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+inline char ascii_tolower(const unsigned char c)
+{
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : static_cast<char>(c);
+}
+
+// The length of an ASCII character is one byte for every charset whose
+// minimum character length is one byte.
+inline int64_t ascii_char_len(const ObCharsetInfo *cs, const char *str, const char *end)
+{
+  if (OB_LIKELY(cs->mbminlen == 1)
+      && OB_LIKELY(static_cast<unsigned char>(*str) < 0x80)) {
+    return 1;
+  }
+  return ob_mbcharlen_ptr(cs, str, end);
+}
+} // namespace
 
 ObTextTokenizer::ObTextTokenizer()
   : ObITokenStream(),
@@ -98,7 +136,7 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
     int64_t token_len = 0;
     // to next non-whitespace pos
     while (OB_SUCC(ret) && found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const int64_t c_len = ascii_char_len(cs_, doc + trav_pos_, doc + doc_len);
       trav_pos_ += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {// if char is invalid, just skip the rest of document
         iter_end_ = true;
@@ -112,7 +150,7 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
     // to next whitespace pos
     while (OB_SUCC(ret) && !found_delimiter()) {
-      const int64_t c_len = ob_mbcharlen_ptr(cs_, doc + trav_pos_, doc + doc_len);
+      const int64_t c_len = ascii_char_len(cs_, doc + trav_pos_, doc + doc_len);
       trav_pos_ += c_len;
       token_len += c_len;
       if (trav_pos_ >= doc_len || 0 == c_len) {
@@ -136,10 +174,12 @@ int ObTextWhitespaceTokenizer::get_next(ObDatum &next_token, int64_t &token_freq
 
 bool ObTextWhitespaceTokenizer::found_delimiter()
 {
-  bool found = false;
-  const char *curr_char = input_doc_->ptr_ + trav_pos_;
-  found = ob_isspace(cs_, *curr_char) || ob_iscntrl(cs_, *curr_char) || ob_ispunct(cs_, *curr_char);
-  return found;
+  const unsigned char *curr_char
+      = reinterpret_cast<const unsigned char *>(input_doc_->ptr_ + trav_pos_);
+  if (OB_LIKELY(cs_->mbminlen == 1) && OB_LIKELY(*curr_char < 0x80)) {
+    return ascii_delimiter(*curr_char);
+  }
+  return ob_isspace(cs_, *curr_char) || ob_iscntrl(cs_, *curr_char) || ob_ispunct(cs_, *curr_char);
 }
 
 ObTokenNormalizer::ObTokenNormalizer()
@@ -260,9 +300,10 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
         const uint32_t raw_token_len = tmp_datum.len_;
         uint32_t first_alnum_pos = 0;
         uint32_t last_alnum_pos = raw_token_len - 1;
+        const bool ascii_fast = (OB_LIKELY(cs_->mbminlen == 1));
         for (uint32_t i = 0; i < raw_token_len; ++i) {
-          const char *character = token + i;
-          if (ob_isalnum(cs_, *character)) {
+          const unsigned char character = static_cast<unsigned char>(token[i]);
+          if ((ascii_fast && character < 0x80) ? ascii_alnum(character) : ob_isalnum(cs_, character)) {
             first_alnum_pos = i;
             found_alnum = true;
             break;
@@ -270,8 +311,8 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
         }
 
         for (int32_t i = raw_token_len - 1; 0 <= i && i < raw_token_len && i >= first_alnum_pos; --i) {
-          const char *character = token + i;
-          if (ob_isalnum(cs_, *character)) {
+          const unsigned char character = static_cast<unsigned char>(token[i]);
+          if ((ascii_fast && character < 0x80) ? ascii_alnum(character) : ob_isalnum(cs_, character)) {
             last_alnum_pos = i;
             found_alnum = true;
             break;
@@ -295,7 +336,27 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
       ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      // A token which only holds ASCII characters is lowercased directly,
+      // instead of going through the Unicode aware case conversion of the
+      // charset. The result is the same for the ASCII range.
+      bool ascii_only = (OB_LIKELY(cs_->mbminlen == 1));
+      for (uint32_t i = 0; ascii_only && i < norm_token_len; ++i) {
+        if (static_cast<unsigned char>(norm_token_ptr[i]) >= 0x80) {
+          ascii_only = false;
+        }
+      }
+      if (ascii_only) {
+        char *lower_buf = static_cast<char *>(norm_allocator_.alloc(norm_token_len));
+        if (OB_ISNULL(lower_buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else {
+          for (uint32_t i = 0; i < norm_token_len; ++i) {
+            lower_buf[i] = ascii_tolower(static_cast<unsigned char>(norm_token_ptr[i]));
+          }
+          norm_lower_token.assign_ptr(lower_buf, norm_token_len);
+          next_token.set_string(norm_lower_token);
+        }
+      } else if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
       } else {
         next_token.set_string(norm_lower_token);
       }

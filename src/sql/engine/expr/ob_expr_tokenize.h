@@ -64,6 +64,12 @@ private:
 
     // check and reform parser properties to standard format
     int reform_parser_properties(const ObString &properties);
+    /**
+     * Compose the properties of a parser which is called without any user
+     * property. The parser defaults are used, so the properties do not have
+     * to be parsed, rebuilt and serialized again.
+     */
+    int compose_default_parser_properties();
     int try_load_dictionary_for_ik();
 
   public:
@@ -78,6 +84,10 @@ private:
       DEFAULT,
       ALL,
     } output_mode_;
+    // the fixed buffer of the composed default properties, it lives as long
+    // as this param object, which covers every consumer of one evaluation
+    static constexpr int64_t DEFAULT_PROPS_BUF_LEN = 64;
+    char default_props_buf_[DEFAULT_PROPS_BUF_LEN];
   };
 
 private:

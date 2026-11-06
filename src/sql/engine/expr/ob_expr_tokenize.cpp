@@ -25,6 +25,7 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/utility/ob_print_utils.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
@@ -212,7 +213,7 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  } else if (OB_FAIL(param.compose_default_parser_properties())) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
   }
   return ret;
@@ -386,6 +387,45 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
   }
 
+  return ret;
+}
+
+int ObExprTokenize::TokenizeParam::compose_default_parser_properties()
+{
+  int ret = OB_SUCCESS;
+  if (!properties_.empty()) {
+    // The user gave some properties: they have to be validated and rebuilt
+    // into the standard format.
+    ret = reform_parser_properties(properties_);
+  } else {
+    storage::ObFTParser parser;
+    if (OB_FAIL(parser.parse_from_str(parser_name_.ptr(), parser_name_.length()))) {
+      // An unknown parser: the generic path is kept, so that the error is
+      // reported exactly as before.
+      ret = reform_parser_properties(properties_);
+    } else if (parser.is_ik()) {
+      // The ik parser always reads its mode from the properties, and its
+      // default mode is the smart one. The other configurations of the ik
+      // parser are not read from the properties by the parser helper, so
+      // only the mode has to be composed.
+      int64_t pos = 0;
+      if (OB_FAIL(databuff_printf(default_props_buf_,
+                                   DEFAULT_PROPS_BUF_LEN,
+                                   pos,
+                                   "{\"%s\":\"%s\"}",
+                                   storage::ObFTSLiteral::CONFIG_NAME_IK_MODE,
+                                   storage::ObFTSLiteral::FT_IK_MODE_SMART))) {
+        // the buffer is big enough, so this cannot happen
+      } else {
+        properties_ = ObString(pos, default_props_buf_);
+      }
+    } else {
+      // The other built-in parsers read their default configuration from an
+      // empty property string, so the properties do not have to be built at
+      // all.
+      properties_ = ObString();
+    }
+  }
   return ret;
 }
 

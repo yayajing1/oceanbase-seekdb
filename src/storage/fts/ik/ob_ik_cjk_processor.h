@@ -41,6 +41,8 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
 
+  virtual void reset_state() override { hits_.clear(); }
+
 private:
   ObList<ObDATrieHit, ObIAllocator> hits_;
   const ObIFTDict &dict_main_;

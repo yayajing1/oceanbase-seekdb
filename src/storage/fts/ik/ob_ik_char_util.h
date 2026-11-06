@@ -52,6 +52,24 @@ public:
                                  const uint8_t char_len,
                                  CharType &type);
 
+  /**
+   * Decode the first character of the input into its unicode code point.
+   * It is the decoding step of classify_first_char(), exposed separately so
+   * that a caller which has to classify the very same character several
+   * times can decode it only once.
+   */
+  static int decode_unicode_by_charset(ObCharsetType cs_type,
+                                        const char *input,
+                                        const uint8_t char_len,
+                                        ob_wc_t &unicode);
+
+  /**
+   * Classify an already decoded code point. It yields exactly the same
+   * CharType as classify_first_char() does for the same character, but it
+   * does not decode the input again.
+   */
+  static int classify_decoded_by_charset(ObCharsetType cs_type, ob_wc_t unicode, CharType &type);
+
   static int check_cn_number(ObCollationType coll_type,
                              const char *input,
                              const uint8_t char_len,
@@ -497,6 +515,57 @@ inline int ObFTCharUtil::classify_first_char(ObCollationType coll_type,
     break;
   }
   return ret;
+}
+
+inline int ObFTCharUtil::decode_unicode_by_charset(ObCharsetType cs_type,
+                                                   const char *input,
+                                                   const uint8_t char_len,
+                                                   ob_wc_t &unicode)
+{
+  int ret = OB_SUCCESS;
+  switch (cs_type) {
+  case CHARSET_UTF8MB4: {
+    ret = ObFTCharUtil::decode_unicode<CHARSET_UTF8MB4>(input, char_len, unicode);
+    break;
+  }
+  case CHARSET_UTF16: {
+    ret = ObFTCharUtil::decode_unicode<CHARSET_UTF16>(input, char_len, unicode);
+    break;
+  }
+  case CHARSET_UTF16LE: {
+    ret = ObFTCharUtil::decode_unicode<CHARSET_UTF16LE>(input, char_len, unicode);
+    break;
+  }
+  default:
+    ret = OB_NOT_SUPPORTED;
+    STORAGE_FTS_LOG(WARN, "Not supported charset type", K(ret), K(cs_type));
+    break;
+  }
+  return ret;
+}
+
+inline int ObFTCharUtil::classify_decoded_by_charset(ObCharsetType cs_type, ob_wc_t unicode, CharType &type)
+{
+  // The predicate order is the same as the one of do_classify(), so the
+  // resulting CharType is identical for the same character.
+  type = CharType::USELESS;
+  if (ObUnicodeBlockUtils::is_alpha(unicode)) {
+    type = CharType::ENGLISH_LETTER;
+  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
+    type = CharType::ARABIC_LETTER;
+  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
+    type = CharType::CHINESE;
+  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
+    type = CharType::OTHER_CJK;
+  } else if (CHARSET_UTF16 == cs_type || CHARSET_UTF16LE == cs_type) {
+    // Only the UTF16 charsets may hold surrogates.
+    if (ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
+      type = CharType::SURROGATE_HIGH;
+    } else if (ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
+      type = CharType::SURROGATE_LOW;
+    }
+  }
+  return OB_SUCCESS;
 }
 
 } // namespace storage
