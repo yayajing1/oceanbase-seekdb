@@ -60,5 +60,26 @@ int ObAIFuncExprInfo::init(ObIAllocator &allocator, const ObString &model_id, sh
   return ret;
 }
 
+int ObAIFuncIEmbed::parse_output_with_index(ObIAllocator &allocator,
+                                             ObJsonObject *http_response,
+                                             ObJsonArray *&embeddings,
+                                             ObArray<int64_t> &indexes)
+{
+  int ret = OB_SUCCESS;
+  ObIJsonBase *result = NULL;
+  if (OB_FAIL(parse_output(allocator, http_response, result))) {
+  } else if (OB_ISNULL(result)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    embeddings = static_cast<ObJsonArray *>(result);
+    for (int64_t i = 0; OB_SUCC(ret) && i < embeddings->element_count(); i++) {
+      // a negative index keeps the element at its position in the response
+      if (OB_FAIL(indexes.push_back(-1))) {
+      }
+    }
+  }
+  return ret;
+}
+
 } // namespace common
 } // namespace oceanbase

@@ -23,6 +23,7 @@
 #include "sql/engine/expr/ob_expr_operator.h"
 #include "sql/engine/expr/ob_expr_result_type_util.h"
 #include "sql/engine/expr/ob_i_expr_extra_info.h"
+#include "lib/container/ob_array.h"
 #include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase 
@@ -97,6 +98,15 @@ public:
                        common::ObArray<ObString> &contents,
                        common::ObJsonObject *config,
                        common::ObJsonObject *&body) = 0;
+  // Parse the embedding response and keep the request index of every element.
+  // The index is the position of the element inside the request, a negative
+  // index means that the element keeps the position it has in the response.
+  // A batched response may be returned in an arbitrary order, the index is
+  // the only reliable way to map an element back to its request.
+  virtual int parse_output_with_index(common::ObIAllocator &allocator,
+                                       common::ObJsonObject *http_response,
+                                       common::ObJsonArray *&embeddings,
+                                       common::ObArray<int64_t> &indexes);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncIEmbed);
 };
