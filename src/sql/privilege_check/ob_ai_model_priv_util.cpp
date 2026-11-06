@@ -35,7 +35,7 @@ int ObAIServiceEndpointPrivUtil::check_ai_model_priv(ObIAllocator &allocator,
                                     bool &has_priv)
 {
   int ret = OB_SUCCESS;
-  
+
   has_priv = false;
   ObSchemaChecker schema_checker;
   if (OB_FAIL(schema_checker.init(schema_guard_))) {
@@ -47,19 +47,19 @@ int ObAIServiceEndpointPrivUtil::check_ai_model_priv(ObIAllocator &allocator,
     share::schema::ObStmtNeedPrivs need_privs(allocator);
     if (OB_FAIL(need_privs.need_privs_.init(1))) {
     } else if (OB_FAIL(need_privs.need_privs_.push_back(need_priv))) {
-    } else if (OB_FAIL(schema_checker.check_priv(session_priv, unused_enable_role_id_array, need_privs))) {
-      if (OB_ERR_NO_PRIVILEGE == ret) {
-        has_priv = false;
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("failed to check ai model privilege", K(ret), 
-                 K(ai_priv_type));
-      }
     } else {
-      has_priv = true;
+      int check_ret = schema_checker.check_priv(session_priv, unused_enable_role_id_array, need_privs);
+      if (OB_SUCC(check_ret)) {
+        has_priv = true;
+      } else if (OB_ERR_NO_PRIVILEGE != check_ret) {
+        // a missing privilege is reported by the caller, any other failure is
+        // an internal problem and has to be propagated
+        ret = check_ret;
+        LOG_WARN("failed to check ai model privilege", K(ret), K(ai_priv_type));
+      }
     }
   }
-  
+
   return ret;
 }
 

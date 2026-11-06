@@ -53,12 +53,14 @@ public:
     bool &has_priv);
 
 private:
-  enum ObAIServiceEndpointPrivType {
-    AI_PRIV_CREATE = OB_PRIV_CREATE_AI_MODEL,
-    AI_PRIV_ALTER  = OB_PRIV_ALTER_AI_MODEL,
-    AI_PRIV_DROP   = OB_PRIV_DROP_AI_MODEL,
-    AI_PRIV_ACCESS = OB_PRIV_ACCESS_AI_MODEL
-  };
+  // The ai model privileges are 64 bit masks.  An enum would give them an
+  // implementation defined underlying type, and clang truncates a value that
+  // does not fit into int to zero, which silently turns the privilege check
+  // into a no-op.  Plain constants keep the whole mask.
+  static constexpr ObPrivSet AI_PRIV_CREATE = OB_PRIV_CREATE_AI_MODEL;
+  static constexpr ObPrivSet AI_PRIV_ALTER  = OB_PRIV_ALTER_AI_MODEL;
+  static constexpr ObPrivSet AI_PRIV_DROP   = OB_PRIV_DROP_AI_MODEL;
+  static constexpr ObPrivSet AI_PRIV_ACCESS = OB_PRIV_ACCESS_AI_MODEL;
 
   int check_ai_model_priv(
     ObIAllocator &allocator,
