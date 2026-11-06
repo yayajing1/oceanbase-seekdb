@@ -46,39 +46,54 @@ int ObDBMSAiService::check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet requi
     if (OB_ISNULL(schema_guard)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
-      sql::ObAIServiceEndpointPrivUtil priv_util(*schema_guard);
       share::schema::ObSessionPrivInfo session_priv;
       if (OB_FAIL(schema_guard->get_session_priv_info(
                                                     ctx.exec_ctx_->get_my_session()->get_priv_user_id(),
                                                     ctx.exec_ctx_->get_my_session()->get_database_name(),
                                                     session_priv))) {
       } else {
-        switch (required_priv) {
-          case OB_PRIV_CREATE_AI_MODEL:
-            if (OB_FAIL(priv_util.check_create_ai_model_priv(tmp_allocator, session_priv, has_priv))) {
-            }
-            break;
-          case OB_PRIV_ALTER_AI_MODEL:
-            if (OB_FAIL(priv_util.check_alter_ai_model_priv(tmp_allocator, session_priv, has_priv))) {
-            }
-            break;
-          case OB_PRIV_DROP_AI_MODEL:
-            if (OB_FAIL(priv_util.check_drop_ai_model_priv(tmp_allocator, session_priv, has_priv))) {
-            }
-            break;
-          case OB_PRIV_ACCESS_AI_MODEL:
-            if (OB_FAIL(priv_util.check_access_ai_model_priv(tmp_allocator, session_priv, has_priv))) {
-            }
-            break;
-          default:
-            ret = OB_INVALID_ARGUMENT;
-            LOG_WARN("invalid privilege type", K(ret), K(required_priv));
-            break;
+        // The ai model privileges are global privileges, so the caller has to
+        // own the privilege bit in its global privilege set.  The shared
+        // privilege checker raises a user error of its own, which would hide
+        // the message of this package, therefore the check is done here.
+        has_priv = OB_PRIV_HAS_ANY(session_priv.user_priv_set_, required_priv);
+        if (!has_priv && ctx.exec_ctx_->get_my_session()->get_enable_role_array().count() > 0) {
+          // the privilege may still be granted through an enabled role
+          sql::ObAIServiceEndpointPrivUtil priv_util(*schema_guard);
+          bool role_priv = false;
+          switch (required_priv) {
+            case OB_PRIV_CREATE_AI_MODEL:
+              if (OB_FAIL(priv_util.check_create_ai_model_priv(tmp_allocator, session_priv, role_priv))) {
+                ret = OB_ERR_UNEXPECTED;
+              }
+              break;
+            case OB_PRIV_ALTER_AI_MODEL:
+              if (OB_FAIL(priv_util.check_alter_ai_model_priv(tmp_allocator, session_priv, role_priv))) {
+                ret = OB_ERR_UNEXPECTED;
+              }
+              break;
+            case OB_PRIV_DROP_AI_MODEL:
+              if (OB_FAIL(priv_util.check_drop_ai_model_priv(tmp_allocator, session_priv, role_priv))) {
+                ret = OB_ERR_UNEXPECTED;
+              }
+              break;
+            case OB_PRIV_ACCESS_AI_MODEL:
+              if (OB_FAIL(priv_util.check_access_ai_model_priv(tmp_allocator, session_priv, role_priv))) {
+                ret = OB_ERR_UNEXPECTED;
+              }
+              break;
+            default:
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("invalid privilege type", K(ret), K(required_priv));
+              break;
+          }
+          has_priv = role_priv;
         }
-        
+
         if (OB_SUCC(ret) && !has_priv) {
           ret = OB_ERR_NO_PRIVILEGE;
-          LOG_WARN("no privilege for ai model operation", K(ret), K(required_priv));
+          LOG_WARN("no privilege for ai model operation", K(ret), K(required_priv),
+                   K(session_priv.user_priv_set_));
         }
       }
     }
