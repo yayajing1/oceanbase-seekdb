@@ -69,6 +69,13 @@ public:
     virtual int parse_output(common::ObIAllocator &allocator,
                              common::ObJsonObject *http_response,
                              common::ObIJsonBase *&result) override;
+    // The openai compatible protocol marks every element of the response with
+    // the index of the request it belongs to, keep it to support a batched
+    // request whose response is returned in an arbitrary order.
+    virtual int parse_output_with_index(common::ObIAllocator &allocator,
+                                         common::ObJsonObject *http_response,
+                                         common::ObJsonArray *&embeddings,
+                                         common::ObArray<int64_t> &indexes) override;
   private:
     DISALLOW_COPY_AND_ASSIGN(ObOpenAIEmbed);
   };
@@ -358,6 +365,9 @@ public:
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
    int call_dense_embedding_vector(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
    int call_dense_embedding_vector_v2(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
+   // Send one merged request for all the contents and map every element of
+   // the response back to the content it belongs to.
+   int call_dense_embedding_batch(ObArray<ObString> &contents, ObJsonObject *config, ObArray<ObString> &results);
    // rerank
    int call_rerank(ObString &query, ObJsonArray *contents, ObJsonArray *&results);
  private:

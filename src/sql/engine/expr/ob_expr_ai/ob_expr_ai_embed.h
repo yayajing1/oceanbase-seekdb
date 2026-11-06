@@ -37,6 +37,9 @@ public:
                                 int64_t param_num,
                                 common::ObExprTypeCtx &type_ctx) const override;
   static int eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);
+  // Evaluate the rows of a batch at once, the rows are merged into a single
+  // request so that a table scan does not send one request per row.
+  static int eval_ai_embed_batch(BATCH_EVAL_FUNC_ARG_DECL);
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, 
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
@@ -45,6 +48,9 @@ private:
   static constexpr int MODEL_IDX = 0;
   static constexpr int CONTENT_IDX = 1;
   static constexpr int DIM_IDX = 2;
+  // The batch evaluation needs a content that is evaluated as a batch and a
+  // model id and a dimension that are the same for every row.
+  static bool can_batch_eval_ai_embed(const ObRawExpr &raw_expr);
   DISALLOW_COPY_AND_ASSIGN(ObExprAIEmbed);
 };
 

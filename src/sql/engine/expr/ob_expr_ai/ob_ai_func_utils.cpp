@@ -254,6 +254,55 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
   return ret;
 }
 
+int ObOpenAIUtils::ObOpenAIEmbed::parse_output_with_index(common::ObIAllocator &allocator,
+                                                          common::ObJsonObject *http_response,
+                                                          common::ObJsonArray *&embeddings,
+                                                          common::ObArray<int64_t> &indexes)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(http_response)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    common::ObJsonArray *result_array = nullptr;
+    common::ObJsonNode *data_node = nullptr;
+    if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
+    } else if (OB_ISNULL(data_node = http_response->get_value("data"))) {
+      ret = OB_INVALID_DATA;
+    } else {
+      common::ObJsonArray *data_array = static_cast<common::ObJsonArray *>(data_node);
+      common::ObJsonNode *embedding_node = nullptr;
+      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
+        if (OB_ISNULL(embedding_node = data_array->get_value(i))) {
+          ret = OB_INVALID_DATA;
+        } else if (embedding_node->json_type() != common::ObJsonNodeType::J_OBJECT) {
+          ret = OB_INVALID_DATA;
+        } else {
+          common::ObJsonObject *embedding_obj = static_cast<common::ObJsonObject *>(embedding_node);
+          common::ObJsonNode *embedding = embedding_obj->get_value("embedding");
+          if (OB_ISNULL(embedding)) {
+            ret = OB_INVALID_DATA;
+          } else if (OB_FAIL(result_array->append(embedding))) {
+          } else {
+            // the protocol marks every element with the index of the request
+            // it belongs to, it is missing in some compatible servers
+            int64_t index = -1;
+            common::ObJsonNode *index_node = embedding_obj->get_value("index");
+            if (OB_NOT_NULL(index_node) && index_node->json_type() == common::ObJsonNodeType::J_INT) {
+              index = static_cast<common::ObJsonInt *>(index_node)->get_int();
+            }
+            if (OB_FAIL(indexes.push_back(index))) {
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        embeddings = result_array;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObOllamaUtils::get_header(common::ObIAllocator &allocator,
                               common::ObArray<ObString> &headers) 
 {
@@ -1507,6 +1556,131 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
     }
   }
   if (ret == OB_INVALID_DATA) {
+    ObString response_str;
+    if (OB_SUCCESS == ObAIFuncJsonUtils::print_json_to_str(*allocator_, response, response_str)) {
+      char http_message_str[1024];
+      snprintf(http_message_str, sizeof(http_message_str), "unexpected http message: %s", response_str.ptr());
+      ObString ob_http_message_str(http_message_str);
+      FORWARD_USER_ERROR(ret, ob_http_message_str.ptr());
+    } else {
+      FORWARD_USER_ERROR(ret, "unexpected http message");
+    }
+  }
+  return ret;
+}
+
+// Map the elements of a batched embedding response back to the contents they
+// belong to.  The response may be returned in an arbitrary order, the index
+// carried by every element is used when the provider supplies it.
+static int map_dense_embedding_batch(ObIAllocator &allocator,
+                                     ObJsonArray *embeddings,
+                                     ObArray<int64_t> &indexes,
+                                     const int64_t content_count,
+                                     const int64_t dimension,
+                                     ObArray<ObString> &results)
+{
+  int ret = OB_SUCCESS;
+  const int64_t embed_count = embeddings->element_count();
+  bool has_index = false;
+  for (int64_t i = 0; i < indexes.count(); i++) {
+    if (indexes[i] >= 0) {
+      has_index = true;
+      break;
+    }
+  }
+  if (!has_index && embed_count != content_count) {
+    // the response does not tell which content every element belongs to and
+    // the element count does not match the request count
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ObArray<ObString> slots;
+    ObArray<char> filled;
+    for (int64_t i = 0; OB_SUCC(ret) && i < content_count; i++) {
+      if (OB_FAIL(slots.push_back(ObString()))) {
+      } else if (OB_FAIL(filled.push_back(0))) {
+      }
+    }
+    int64_t filled_count = 0;
+    for (int64_t i = 0; OB_SUCC(ret) && i < embed_count; i++) {
+      const int64_t pos = has_index ? indexes[i] : i;
+      if (pos < 0 || pos >= content_count) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (filled[pos]) {
+        // two elements claim the same content
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObIJsonBase *j_base = embeddings->get_value(i);
+        if (OB_ISNULL(j_base) || j_base->json_type() != ObJsonNodeType::J_ARRAY) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ObJsonArray *vec = static_cast<ObJsonArray *>(j_base);
+          if (dimension > 0 && vec->element_count() != dimension) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, result dimension is not equal to dimension");
+          } else {
+            ObString result_str;
+            if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, vec, result_str))) {
+            } else {
+              slots[pos] = result_str;
+              filled[pos] = 1;
+              filled_count++;
+            }
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && filled_count != content_count) {
+      // some content has no element in the response
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < content_count; i++) {
+        if (OB_FAIL(results.push_back(slots[i]))) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAIFuncModel::call_dense_embedding_batch(ObArray<ObString> &contents,
+                                              ObJsonObject *config,
+                                              ObArray<ObString> &results)
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObString> headers;
+  ObJsonObject *body = nullptr;
+  ObJsonObject *response = nullptr;
+  ObJsonArray *embeddings = nullptr;
+  ObArray<int64_t> indexes;
+  ObAIFuncIEmbed *embed_provider = nullptr;
+  ObString unencrypted_access_key;
+  ObString request_model_name = get_request_model_name();
+  ObAIFuncClient client;
+  int64_t dimension = 0;
+  if (OB_NOT_NULL(config)) {
+    ObJsonNode *dimension_node = config->get_value("dimensions");
+    if (OB_ISNULL(dimension_node)) {
+      // do nothing
+    } else if (dimension_node->json_type() != ObJsonNodeType::J_INT) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      dimension = static_cast<ObJsonInt *>(dimension_node)->get_int();
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!is_dense_embedding_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, info type is not dense embedding");
+  } else if (OB_FAIL(ObAIFuncUtils::get_embed_provider(*allocator_, endpoint_info_.get_provider(), embed_provider))) {
+  } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
+  } else if (OB_FAIL(embed_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(embed_provider->get_body(*allocator_, request_model_name, contents, config, body))) {
+  } else if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
+  } else if (OB_FAIL(embed_provider->parse_output_with_index(*allocator_, response, embeddings, indexes))) {
+  } else {
+    ret = map_dense_embedding_batch(*allocator_, embeddings, indexes, contents.count(), dimension, results);
+  }
+  if (OB_FAIL(ret) && ret == OB_INVALID_DATA) {
     ObString response_str;
     if (OB_SUCCESS == ObAIFuncJsonUtils::print_json_to_str(*allocator_, response, response_str)) {
       char http_message_str[1024];
