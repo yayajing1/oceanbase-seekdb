@@ -24,6 +24,7 @@
 #include "storage/fts/dict/ob_ft_dict.h"
 
 #include <cstddef>
+#include <cstring>
 
 /* File Description:
  * @brief tools to build a double array trie dictionary.
@@ -70,6 +71,22 @@ public:
 private:
   struct Header header_;
 } __attribute__((packed));
+
+/**
+ * @class ObFTDATNode
+ * @brief One node of the double array trie.
+ *
+ * The base value and the check value of a node are always read together, so
+ * they are stored together.  The node array is large and every character of
+ * every document reads a node of it, so a node which holds both values is
+ * touched by one cache line instead of two: with two separate arrays every
+ * step of the trie costs two random accesses into a multi megabyte array.
+ */
+struct ObFTDATNode
+{
+  int32_t base_;
+  int32_t check_;
+};
 
 /**
  * @class ObFTDAT
@@ -167,12 +184,72 @@ template <typename DataType = void>
 class ObFTDATReader
 {
 public:
-  ObFTDATReader(ObFTDAT *dat) : dat_(dat) {}
+  ObFTDATReader(ObFTDAT *dat) : dat_(dat)
+  {
+    clear_char_code_cache();
+  }
 
   // Match single word with hit.
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
+
+private:
+  /**
+   * The code of a character is looked up in the word map of the dat, and the
+   * map is a hash map whose key is the character itself.  The hash of the key
+   * is a murmur hash, which is a lot of work for a key of one to four bytes,
+   * and the hash is computed again for every single character of every
+   * document.  The code of a character never changes, so the result of the
+   * lookup is remembered here.  The cache is a direct mapped table of the
+   * character bytes, and it is private to the reader, so no synchronization is
+   * needed: a reader belongs to one dictionary of one parser, and a parser is
+   * owned by one thread.
+   *
+   * The first step of the double array trie is remembered as well.  It starts
+   * at the root of the trie, so its result only depends on the code of the
+   * character, and it is the step which every character of every document
+   * needs.
+   */
+  int find_char_code(const ObString &ft_char,
+                     ObFTWordCode &code,
+                     int32_t &first_idx,
+                     int32_t &first_is_leaf) const;
+
+  void clear_char_code_cache()
+  {
+    // Only the validity of the slots is reset, the entries themselves are
+    // read only when their slot is valid.  Clearing the whole table would
+    // cost more than the lookups which it saves, because a parser is built
+    // for every document.
+    memset(valid_bits_, 0, sizeof(valid_bits_));
+  }
+
+  // The cache is a direct mapped table.  It is much smaller than the word
+  // map of the dat, so it stays in the cpu cache while the word map does
+  // not, which is the real win: the lookup of the word map misses the cache
+  // on nearly every character.
+  static constexpr int64_t CHAR_CODE_CACHE_SIZE = 2048; // power of two
+  static constexpr int32_t CHAR_CODE_NOT_FOUND = -1;
+  // the value of first_idx_ when the character has no child in the trie
+  static constexpr int32_t CHAR_CODE_NO_CHILD = -1;
+  // the child of the root is a leaf of the trie
+  static constexpr int32_t CHAR_CODE_FIRST_IS_LEAF = 0x40000000;
+
+  struct CharCodeEntry
+  {
+    uint64_t key_;
+    int32_t code_;
+    // the index of the child of the root, CHAR_CODE_NO_CHILD when the
+    // character starts no word of the dictionary, the flag
+    // CHAR_CODE_FIRST_IS_LEAF is set when that child is a leaf of the trie
+    int32_t first_idx_;
+  } __attribute__((packed));
+
+  static constexpr int64_t CHAR_CODE_VALID_WORDS = CHAR_CODE_CACHE_SIZE / 64;
+
+  mutable CharCodeEntry char_code_cache_[CHAR_CODE_CACHE_SIZE];
+  mutable uint64_t valid_bits_[CHAR_CODE_VALID_WORDS];
 
 private:
   ObFTDAT *dat_;

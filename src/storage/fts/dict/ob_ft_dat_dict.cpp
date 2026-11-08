@@ -39,10 +39,12 @@ int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
     ret = OB_INIT_TWICE;
   } else {
     size_t map_size = ObArrayHashMap::estimate_size(trie.node_num());
+    // the node array which follows the word map is aligned, so that a node is
+    // read with one aligned access
+    map_size = (map_size + 7) & ~static_cast<size_t>(7);
     size_t array_size = trie.node_num() * 6; // by experience.
-    size_t base_size = array_size * sizeof(int32_t);
-    size_t check_size = base_size;
-    size_t total_size = sizeof(ObFTDAT) + map_size + base_size + check_size;
+    size_t node_size = array_size * sizeof(ObFTDATNode);
+    size_t total_size = sizeof(ObFTDAT) + map_size + node_size;
 
     if (OB_ISNULL(dat_ = static_cast<ObFTDAT *>(alloc_.alloc(total_size)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -51,7 +53,7 @@ int ObFTDATBuilder<DATA_TYPE>::init(ObFTTrie<DATA_TYPE> &trie)
       dat_->mem_block_size_ = total_size;
       dat_->array_size_ = array_size;
       dat_->base_offset_ = map_size;
-      dat_->check_offset_ = dat_->base_offset_ + base_size;
+      dat_->check_offset_ = 0;
       map_ = dat_->get_map();
       if (OB_FAIL(map_->init(trie.node_num()))) {
       }
@@ -69,9 +71,8 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
   if (OB_ISNULL(dat_) || OB_ISNULL(dat_->buff)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
-    int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
-    base[ObFTDAT::FIRST_INDEX] = 1;
+    ObFTDATNode *nodes = reinterpret_cast<ObFTDATNode *>(dat_->buff + dat_->base_offset_);
+    nodes[ObFTDAT::FIRST_INDEX].base_ = 1;
     ObArenaAllocator alloc(lib::ObMemAttr("Tmp dfs"));
     ObList<ObFTTrieNode<DATA_TYPE> *, ObIAllocator> dfs_queue(alloc);
 
@@ -90,7 +91,7 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
 
       // mark as leaf
       if (node->is_leaf_) {
-        base[rootIdx] = -1;
+        nodes[rootIdx].base_ = -1;
       }
 
       if (level != node->dat_build_info_.level_) {
@@ -125,7 +126,7 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
                 child_index.child_->dat_build_info_.code_ = child_code;
               }
               child_code = child_index.child_->dat_build_info_.code_;
-              if (check[try_base + child_code] != 0) {
+              if (nodes[try_base + child_code].check_ != 0) {
                 conflict = true;
               }
             }
@@ -137,9 +138,9 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
 
             if (!conflict) {
               if (node->is_leaf_) {
-                base[rootIdx] = -try_base;
+                nodes[rootIdx].base_ = -try_base;
               } else {
-                base[rootIdx] = try_base;
+                nodes[rootIdx].base_ = try_base;
               }
               break;
             }
@@ -166,11 +167,10 @@ int ObFTDATBuilder<DATA_TYPE>::build_from_trie(ObFTTrie<DATA_TYPE> &trie)
 
               if (my_index >= dat_->array_size_) {
                 expand();
-                base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
-                check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
+                nodes = reinterpret_cast<ObFTDATNode *>(dat_->buff + dat_->base_offset_);
               }
               child_index.child_->dat_build_info_.state_index_ = my_index;
-              check[my_index] = rootIdx;
+              nodes[my_index].check_ = rootIdx;
               dfs_queue.push_back(child_index.child_);
             }
           }
@@ -198,9 +198,8 @@ int ObFTDATBuilder<DATA_TYPE>::expand()
 {
   int ret = OB_SUCCESS;
   size_t array_size = dat_->array_size_;
-  size_t base_inc = array_size * sizeof(int32_t);
-  size_t check_inc = array_size * sizeof(int32_t);
-  size_t buffer_size = dat_->mem_block_size_ + base_inc + check_inc;
+  size_t node_inc = array_size * sizeof(ObFTDATNode);
+  size_t buffer_size = dat_->mem_block_size_ + node_inc;
 
   ObFTDAT *new_dat = nullptr;
   if (OB_ISNULL(new_dat = static_cast<ObFTDAT *>(alloc_.alloc(buffer_size)))) {
@@ -210,12 +209,9 @@ int ObFTDATBuilder<DATA_TYPE>::expand()
     new_dat->mem_block_size_ = buffer_size;
     new_dat->array_size_ = array_size * 2;
     new_dat->base_offset_ = dat_->base_offset_;
-    new_dat->check_offset_ = dat_->check_offset_ + base_inc;
-    // map and base
-    MEMCPY(new_dat->buff, dat_->buff, dat_->check_offset_ - 0);
-    // check
-    size_t check_size = array_size * sizeof(int32_t);
-    MEMCPY(new_dat->buff + new_dat->check_offset_, dat_->buff + dat_->check_offset_, check_size);
+    new_dat->check_offset_ = 0;
+    // the word map and the nodes which are already used
+    MEMCPY(new_dat->buff, dat_->buff, dat_->base_offset_ + array_size * sizeof(ObFTDATNode));
     alloc_.free(dat_);
     dat_ = new_dat;
     map_ = dat_->get_map();
@@ -247,20 +243,107 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 }
 
 template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::find_char_code(const ObString &ft_char,
+                                             ObFTWordCode &code,
+                                             int32_t &first_idx,
+                                             int32_t &first_is_leaf) const
+{
+  int ret = OB_SUCCESS;
+  first_idx = 0;
+  first_is_leaf = 0;
+  const int32_t char_len = ft_char.length();
+  const ObFTDATNode *nodes = reinterpret_cast<const ObFTDATNode *>(dat_->buff + dat_->base_offset_);
+  // The first step of the trie starts at the root, so its result only depends
+  // on the code of the character.
+  auto calc_first_step = [&](const ObFTWordCode the_code) {
+    const int32_t idx = abs(nodes[1].base_) + the_code;
+    if (nodes[idx].check_ != 1) {
+      first_idx = CHAR_CODE_NO_CHILD;
+      first_is_leaf = 0;
+    } else {
+      first_idx = idx;
+      first_is_leaf = (nodes[idx].base_ < 0) ? 1 : 0;
+    }
+  };
+  if (char_len <= 0 || char_len > common::ObCharset::MAX_MB_LEN) {
+    // Not a normal single character, use the original path.
+    ObFTSingleWord word;
+    word.set_word(ft_char.ptr(), ft_char.length());
+    ret = dat_->get_map()->find(word, code);
+    if (OB_SUCC(ret)) {
+      calc_first_step(code);
+    }
+    return ret;
+  }
+
+  // The key of the cache is the length of the character and its bytes.  The
+  // bytes of a utf8 character are packed in little endian order, so that the
+  // key of two different characters never collides.
+  uint64_t key = static_cast<uint64_t>(char_len) << 32;
+  for (int32_t i = 0; i < char_len; ++i) {
+    key |= static_cast<uint64_t>(static_cast<uint8_t>(ft_char.ptr()[i])) << (8 * i);
+  }
+
+  const uint64_t slot = ((key * 0x9E3779B97F4A7C15ULL) >> 53) & (CHAR_CODE_CACHE_SIZE - 1);
+  const uint64_t bit = 1ULL << (slot & 63);
+  const uint64_t bit_word = slot >> 6;
+  if (0 != (valid_bits_[bit_word] & bit)) {
+    const CharCodeEntry &entry = char_code_cache_[slot];
+    if (entry.key_ == key) {
+      if (CHAR_CODE_NOT_FOUND == entry.code_) {
+        return OB_ENTRY_NOT_EXIST;
+      }
+      code = entry.code_;
+      if (entry.first_idx_ > 0) {
+        first_idx = entry.first_idx_ & ~CHAR_CODE_FIRST_IS_LEAF;
+        first_is_leaf = (0 != (entry.first_idx_ & CHAR_CODE_FIRST_IS_LEAF)) ? 1 : 0;
+      } else {
+        first_idx = entry.first_idx_;
+        first_is_leaf = 0;
+      }
+      return OB_SUCCESS;
+    }
+  }
+
+  // The character is not cached yet, look it up in the word map of the dat
+  // and remember the result, so that the next occurrence of the character
+  // does not touch the word map again.
+  ObFTSingleWord ft_word;
+  ft_word.set_word(ft_char.ptr(), ft_char.length());
+  ret = dat_->get_map()->find(ft_word, code);
+  if (OB_FAIL(ret) && OB_ENTRY_NOT_EXIST != ret) {
+    return ret;
+  }
+  CharCodeEntry &entry = char_code_cache_[slot];
+  entry.key_ = key;
+  if (OB_SUCC(ret)) {
+    // The first step of the trie is remembered as well: it starts at the root
+    // of the trie, so its result only depends on the code.
+    calc_first_step(code);
+    entry.code_ = code;
+    entry.first_idx_ = first_idx | (first_is_leaf ? CHAR_CODE_FIRST_IS_LEAF : 0);
+  } else {
+    entry.code_ = CHAR_CODE_NOT_FOUND;
+    entry.first_idx_ = CHAR_CODE_NO_CHILD;
+  }
+  valid_bits_[bit_word] |= bit;
+  return ret;
+}
+
+template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              const ObDATrieHit &last_hit,
                                              ObDATrieHit &hit) const
 {
   int ret = OB_SUCCESS;
-  ObFTWordCode code;
+  ObFTWordCode code = 0;
+  int32_t first_idx = 0;
+  int32_t first_is_leaf = 0;
   hit.set_unmatch();
   auto *map = dat_->get_map();
-  int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
-  int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
+  ObFTDATNode *nodes = reinterpret_cast<ObFTDATNode *>(dat_->buff + dat_->base_offset_);
 
-  ObFTSingleWord word;
-  word.set_word(ft_char.ptr(), ft_char.length());
-  if (OB_FAIL(dat_->get_map()->find(word, code)) && OB_ENTRY_NOT_EXIST != ret) {
+  if (OB_FAIL(find_char_code(ft_char, code, first_idx, first_is_leaf)) && OB_ENTRY_NOT_EXIST != ret) {
   } else if (OB_ENTRY_NOT_EXIST == ret) {
     ret = OB_SUCCESS;
     hit.set_unmatch();
@@ -271,24 +354,39 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
       hit = last_hit;
     }
     if (0 == hit.base_idx_) {
-      hit.base_idx_ = 1; // from current to do check;
-    }
-    // from current place to do check
-    int32_t idx = abs(base[hit.base_idx_]) + code;
-
-    if (check[idx] != hit.base_idx_) {
-      hit.set_unmatch();
-    } else if (base[idx] < 0) {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_match();
-      hit.set_prefix(); // to be checked next time
+      // The match starts at the root of the trie.  The result of the first
+      // step is taken from the cache of the character, so that the node array
+      // of the trie is not read again for every character.
+      hit.base_idx_ = 1;
+      if (first_idx > 0) {
+        hit.base_idx_ = first_idx;
+        hit.end_pos_ = hit.end_pos_ + ft_char.length();
+        hit.char_cnt_++;
+        hit.set_prefix();
+        if (0 != first_is_leaf) {
+          hit.set_match();
+        }
+      } else {
+        hit.set_unmatch();
+      }
     } else {
-      hit.base_idx_ = idx;
-      hit.end_pos_ = hit.end_pos_ + ft_char.length();
-      hit.char_cnt_++;
-      hit.set_prefix();
+      // from current place to do check
+      int32_t idx = abs(nodes[hit.base_idx_].base_) + code;
+
+      if (nodes[idx].check_ != hit.base_idx_) {
+        hit.set_unmatch();
+      } else if (nodes[idx].base_ < 0) {
+        hit.base_idx_ = idx;
+        hit.end_pos_ = hit.end_pos_ + ft_char.length();
+        hit.char_cnt_++;
+        hit.set_match();
+        hit.set_prefix(); // to be checked next time
+      } else {
+        hit.base_idx_ = idx;
+        hit.end_pos_ = hit.end_pos_ + ft_char.length();
+        hit.char_cnt_++;
+        hit.set_prefix();
+      }
     }
   }
   return ret;

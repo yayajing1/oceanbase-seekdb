@@ -38,7 +38,8 @@ public:
   ObFTRangeDict(ObIAllocator &alloc,
                 ObFTCacheRangeContainer *range_container,
                 const ObFTDictDesc &desc)
-      : is_inited_(false), desc_(desc), range_alloc_(lib::ObMemAttr("Range Dict")),
+      : is_inited_(false), is_range_ordered_(false), desc_(desc),
+        range_alloc_(lib::ObMemAttr("Range Dict")),
         range_dicts_(&range_alloc_), range_container_(range_container)
   {
   }
@@ -98,10 +99,21 @@ private:
   }
 
   int find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const;
+  /**
+   * Check that the ranges are sorted by their start word and that they do not
+   * overlap.  The ranges are built from a sorted iteration of the dictionary,
+   * so this holds, but the check keeps the binary search honest: when it does
+   * not hold, the linear search is used and the result is the one of the
+   * original implementation.
+   */
+  bool check_range_order() const;
 
 private:
   static constexpr int DEFAULT_KEY_PER_RANGE = 50000; // by estimated
   bool is_inited_;
+  // true when the ranges are sorted and disjoint, so that the range of a
+  // character can be found with a binary search
+  bool is_range_ordered_;
   ObFTDictDesc desc_;
   ObArenaAllocator range_alloc_;
   ObVector<ObFTRange, ObArenaAllocator> range_dicts_;
