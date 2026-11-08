@@ -37,12 +37,46 @@
 #include "storage/fts/dict/ob_ft_dict_table_iter.h"
 #include "storage/fts/dict/ob_ft_trie.h"
 
+#include <cstring>
+
 #define USING_LOG_PREFIX STORAGE_FTS
 
 namespace oceanbase
 {
 namespace storage
 {
+
+namespace
+{
+/**
+ * Compare two utf8 strings byte by byte.
+ *
+ * The utf8mb4_bin collation compares the code points of the two strings, and
+ * the order of the code points of a utf8 string is the order of its bytes, so
+ * the result is the same as the result of ObCharset::strcmp with the
+ * utf8mb4_bin collation.  The byte wise comparison is much cheaper, because
+ * it does not decode the characters and does not go through the collation
+ * interface of the charset.
+ */
+inline int compare_utf8_bytes(const ObString &lhs, const ObString &rhs)
+{
+  const int32_t lhs_len = lhs.length();
+  const int32_t rhs_len = rhs.length();
+  const int32_t min_len = lhs_len < rhs_len ? lhs_len : rhs_len;
+  int ret = 0;
+  if (min_len > 0) {
+    ret = memcmp(lhs.ptr(), rhs.ptr(), min_len);
+  }
+  if (0 == ret) {
+    if (lhs_len < rhs_len) {
+      ret = -1;
+    } else if (lhs_len > rhs_len) {
+      ret = 1;
+    }
+  }
+  return ret;
+}
+} // namespace
 
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
@@ -307,6 +341,12 @@ int ObFTRangeDict::init()
     ret = OB_INIT_TWICE;
   } else {
     if (OB_FAIL(build_dict_from_cache(*range_container_))) {
+    } else {
+      // The ranges are built from a sorted iteration of the dictionary, so
+      // they are sorted and disjoint.  The check keeps the binary search
+      // honest: when it does not hold, the linear search is used and the
+      // result is the one of the original implementation.
+      is_range_ordered_ = check_range_order();
     }
     is_inited_ = true;
   }
@@ -382,17 +422,37 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  if (is_range_ordered_) {
+    // The ranges are sorted and disjoint, so at most one of them can contain
+    // the word.  The range is found with a binary search, which needs a
+    // logarithmic number of comparisons instead of one comparison pair per
+    // range.  The original implementation walked over every range and did not
+    // stop at the first range whose start word is already behind the word, so
+    // every character paid for the whole list of the ranges.
+    int64_t low = 0;
+    int64_t high = range_dicts_.size() - 1;
+    int64_t candidate = -1;
+    while (low <= high) {
+      const int64_t middle = low + (high - low) / 2;
+      if (compare_utf8_bytes(range_dicts_[middle].start_.get_word(), single_word) <= 0) {
+        candidate = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    if (candidate >= 0
+        && compare_utf8_bytes(range_dicts_[candidate].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[candidate].dict_;
       found = true;
+    }
+  } else {
+    for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+      if (compare_utf8_bytes(range_dicts_[i].start_.get_word(), single_word) <= 0
+          && compare_utf8_bytes(range_dicts_[i].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {
@@ -400,6 +460,25 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
     ret = OB_ENTRY_NOT_EXIST;
   }
   return ret;
+}
+
+bool ObFTRangeDict::check_range_order() const
+{
+  bool ordered = true;
+  for (int64_t i = 1; OB_LIKELY(ordered) && i < range_dicts_.size(); ++i) {
+    // the start word of a range is not behind the start word of the next one
+    if (compare_utf8_bytes(range_dicts_[i - 1].start_.get_word(),
+                           range_dicts_[i].start_.get_word())
+        > 0) {
+      ordered = false;
+    } else if (compare_utf8_bytes(range_dicts_[i - 1].end_.get_word(),
+                                  range_dicts_[i].start_.get_word())
+               >= 0) {
+      // the ranges overlap
+      ordered = false;
+    }
+  }
+  return ordered;
 }
 
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
