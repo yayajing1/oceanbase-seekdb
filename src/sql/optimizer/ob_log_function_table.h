@@ -30,11 +30,30 @@ public:
         table_id_(OB_INVALID_ID),
         value_expr_(NULL),
         table_name_(),
-        access_exprs_() { }
+        access_exprs_(),
+        file_type_(0),
+        file_header_mode_(-1),
+        file_path_(),
+        file_describe_mode_(false) { }
   virtual ~ObLogFunctionTable() {}
   void add_values_expr(ObRawExpr* expr) { value_expr_ = expr; }
   const ObRawExpr* get_value_expr() const { return value_expr_; }
   ObRawExpr* get_value_expr() { return value_expr_; }
+  // "file as database" table, file_type_ is 0 for an ordinary function table
+  void set_file_info(int64_t file_type,
+                     int64_t header_mode,
+                     const common::ObString &path,
+                     bool describe_mode)
+  {
+    file_type_ = file_type;
+    file_header_mode_ = header_mode;
+    file_path_ = path;
+    file_describe_mode_ = describe_mode;
+  }
+  int64_t get_file_type() const { return file_type_; }
+  int64_t get_file_header_mode() const { return file_header_mode_; }
+  const common::ObString &get_file_path() const { return file_path_; }
+  bool get_file_describe_mode() const { return file_describe_mode_; }
   virtual uint64_t hash(uint64_t seed) const override;
   int generate_access_exprs();
   ObIArray<ObRawExpr*> &get_access_exprs() { return access_exprs_; }
@@ -56,6 +75,10 @@ private:
   ObRawExpr* value_expr_;
   common::ObString table_name_;
   common::ObSEArray<ObRawExpr*, 4, common::ModulePageAllocator, true> access_exprs_;
+  int64_t file_type_;
+  int64_t file_header_mode_;
+  common::ObString file_path_;
+  bool file_describe_mode_;
   DISALLOW_COPY_AND_ASSIGN(ObLogFunctionTable);
 };
 }

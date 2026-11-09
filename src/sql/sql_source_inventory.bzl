@@ -188,6 +188,18 @@ SQL_UNITY_GROUPS = [
         external_srcs = [],
     ),
     struct(
+        name = "ob_sql_engine_file_table_0",
+        language = "c++",
+        srcs = [
+            "src/sql/engine/file_table/file_table_csv.cpp",
+            "src/sql/engine/file_table/file_table_glob.cpp",
+            "src/sql/engine/file_table/file_table_jsonl.cpp",
+            "src/sql/engine/file_table/file_table_parquet.cpp",
+            "src/sql/engine/file_table/file_table_util.cpp",
+        ],
+        generated_srcs = [],
+        external_srcs = [],
+    ),    struct(
         name = "ob_sql_engine_aggregate_core_0",
         language = "c++",
         srcs = [

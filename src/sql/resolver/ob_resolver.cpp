@@ -164,15 +164,18 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   }
 
   if (OB_SUCC(ret)) {
-    params_.resolver_scope_stmt_type_ = parse_tree.type_;
+    /* "DESCRIBE SELECT ..." over a file table is answered by a select, the
+       statement is scoped as a plain select */
+    const ObItemType scope_stmt_type = (T_DESCRIBE_SELECT == parse_tree.type_) ? T_SELECT : parse_tree.type_;
+    params_.resolver_scope_stmt_type_ = scope_stmt_type;
     params_.session_info_->set_stmt_type(
-      ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_));
+      ObResolverUtils::get_stmt_type_by_item_type(scope_stmt_type));
     ObExecContext *exec_ctx = params_.session_info_->get_cur_exec_ctx();
     if (exec_ctx != nullptr && exec_ctx->get_sql_ctx() != nullptr) {
       //save the current stmt type on my context,
       //some other modules may need to get the current SQL stmt type through its context
       ObSqlCtx *sql_ctx = exec_ctx->get_sql_ctx();
-      sql_ctx->stmt_type_ = ObResolverUtils::get_stmt_type_by_item_type(parse_tree.type_);
+      sql_ctx->stmt_type_ = ObResolverUtils::get_stmt_type_by_item_type(scope_stmt_type);
     }
 
     switch (real_parse_tree->type_) {
@@ -236,6 +239,21 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_SELECT: {
         REGISTER_SELECT_STMT_RESOLVER(Select);
+        break;
+      }
+      case T_DESCRIBE_SELECT: {
+        /* DESCRIBE SELECT ... over a file table, the file table exposes the
+           six description columns and the statement behaves like a select */
+        if (OB_UNLIKELY(1 != real_parse_tree->num_child_
+                        || OB_ISNULL(real_parse_tree->children_)
+                        || OB_ISNULL(real_parse_tree->children_[0]))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          params_.resolver_scope_stmt_type_ = T_SELECT;
+          params_.is_file_describe_ = true;
+          ret = select_stmt_resolver_func<ObSelectResolver>(params_, *real_parse_tree->children_[0], stmt);
+          params_.is_file_describe_ = false;
+        }
         break;
       }
       case T_INSERT: {

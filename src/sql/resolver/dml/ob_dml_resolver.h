@@ -205,6 +205,16 @@ public:
   int resolve_joined_table_item(const ParseNode &parse_node, JoinedTable *&joined_table);
   int resolve_function_table_item(const ParseNode &table_node,
                                   TableItem *&table_item);
+  int resolve_file_table_item(const ParseNode &table_node,
+                               TableItem *&table_item);
+  int add_file_table_column(TableItem *table_item,
+                             int64_t index,
+                             const common::ObString &column_name,
+                             const ObRawExprResType &res_type);
+  int check_file_table_arg_value(const ParseNode &value_node,
+                                 common::ObString &str_value,
+                                 int64_t &int_value,
+                                 bool &is_string);
   int resolve_json_table_item(const ParseNode &table_node,
                               TableItem *&table_item);
   int resolve_unnest_item(const ParseNode &table_node, TableItem *&table_item);

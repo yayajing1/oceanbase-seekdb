@@ -52,6 +52,26 @@
   } \
   malloc_non_terminal_node(explain_stmt, result->malloc_pool_, T_EXPLAIN, 5, \
                            type_node, display_node, into_table, set_statement_id, stmt);
+
+/* True when the parse tree contains a file table function, e.g.
+   "select * from read_csv('/tmp/a.csv')".  Only such a statement is turned
+   into a column description, every other "DESCRIBE SELECT" keeps the
+   historical "DESCRIBE is an alias of EXPLAIN" behaviour. */
+static int parse_tree_has_file_table(const struct _ParseNode *node)
+{
+  if (NULL == node) {
+    return 0;
+  } else if (T_FILE_TABLE_EXPRESSION == node->type_) {
+    return 1;
+  } else if (NULL != node->children_) {
+    for (int32_t i = 0; i < node->num_child_; ++i) {
+      if (parse_tree_has_file_table(node->children_[i])) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
 %}
 
 %destructor {destroy_tree($$);}<node>
@@ -511,6 +531,8 @@ END_P SET_VAR DELIMITER
 %type <node> column_list_with_boost with_param_column_ref
 %type <node> es_sql_opt
 %type <node> hybrid_search_expr hybrid_search_param
+%type <node> file_table_expr file_table_args
+%type <node> copy_stmt copy_options copy_option copy_option_list
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
 %type <node> flush_privileges_stmt opt_flush_privileges_scope
@@ -662,6 +684,7 @@ stmt:
       check_question_mark($$, result);
     }
   }
+  | copy_stmt { $$ = $1; check_question_mark($$, result); }
   ;
 
 /*****************************************************************************
@@ -10848,6 +10871,10 @@ tbl_name
 {
   $$ = $1;
 }
+| file_table_expr
+{
+  $$ = $1;
+}
 ;
 
 tbl_name:
@@ -12265,7 +12292,15 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  if (1 == $1->value_ && T_SELECT == $2->type_ && parse_tree_has_file_table($2)) {
+    /* DESCRIBE/DESC select over a file table: duckdb style column description */
+    malloc_non_terminal_node($$, result->malloc_pool_, T_DESCRIBE_SELECT, 1, $2);
+  } else {
+    GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12305,9 +12340,9 @@ explain_or_desc relation_factor opt_desc_column_option
 ;
 
 explain_or_desc:
-EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+EXPLAIN { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 0; }
+| DESCRIBE { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
+| DESC  { malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_ = 1; }
 ;
 
 explainable_stmt:
@@ -17451,6 +17486,99 @@ UNNEST '(' simple_expr_list ')'
 }
 ;
 
+/* file table functions: read_csv/read_json/read_ndjson/read_parquet/glob */
+file_table_expr:
+relation_name '(' file_table_args ')'
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, NULL);
+  /* The file path and the file options must stay literal.  The schema of a
+     file table is inferred from the file while resolving, so the path may
+     never be turned into a runtime parameter: a parameterized plan would
+     freeze the schema of the first file and would be shared by every other
+     file.  is_tree_not_param_ forbids the parameterization of this node and
+     of its whole sub tree. */
+  $$->is_tree_not_param_ = 1;
+}
+| relation_name '(' file_table_args ')' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $5);
+  $$->is_tree_not_param_ = 1;
+}
+| relation_name '(' file_table_args ')' AS relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_EXPRESSION, 3, $1, $3, $6);
+  $$->is_tree_not_param_ = 1;
+}
+;
+
+file_table_args:
+/* empty */
+{
+  $$ = NULL;
+}
+| expr_list
+{
+  $$ = $1;
+}
+;
+
+/* COPY table-or-query TO path */
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE copy_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_STMT, 3, $3, $6, $7);
+}
+| COPY relation_name TO STRING_VALUE copy_options
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_STMT, 3, $2, $4, $5);
+}
+;
+
+copy_options:
+/* empty */
+{
+  $$ = NULL;
+}
+| '(' copy_option_list ')'
+{
+  $$ = $2;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  malloc_list_node($$, result->malloc_pool_, T_COPY_OPTION_LIST, 2, 1, $1);
+}
+| copy_option_list ',' copy_option
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+copy_option:
+relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, NULL);
+}
+| relation_name relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+| relation_name STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $2);
+}
+| relation_name COMP_EQ relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $3);
+}
+| relation_name COMP_EQ STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $3);
+}
+;
+
 hybrid_search_expr:
 HYBRID_SEARCH '(' literal ',' hybrid_search_param ')'
 {
@@ -17752,7 +17880,7 @@ ACCOUNT
 |       JSON_ARRAYAGG
 |       JSON_OBJECTAGG
 |       JSON_QUERY
-|       JSON_TABLE
+|       JSON_TABLE %prec LOWER_PARENS
 |       KEYWORD
 |       KEY_BLOCK_SIZE
 |       KEY_VERSION
@@ -18111,7 +18239,7 @@ ACCOUNT
 |       UNCOMMITTED
 |       UNCONDITIONAL
 |       UNDEFINED
-|       UNNEST
+|       UNNEST %prec LOWER_PARENS
 |       UNICODE
 |       UNKNOWN
 |       UNLOCKED
@@ -18180,7 +18308,7 @@ ACCOUNT
 |       MICRO_INDEX_CLUSTERED
 |       INCONSISTENT 
 |       INDIVIDUAL
-|       HYBRID_SEARCH
+|       HYBRID_SEARCH %prec LOWER_PARENS
 ;
 
 unreserved_keyword_special:

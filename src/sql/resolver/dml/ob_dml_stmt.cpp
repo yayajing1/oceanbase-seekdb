@@ -158,6 +158,23 @@ int TableItem::deep_copy_json_table_def(const ObJsonTableDef& jt_def, ObIRawExpr
   return ret;
 }
 
+int ObFileTableDef::deep_copy(ObIRawExprCopier &expr_copier,
+                              const ObFileTableDef &other,
+                              ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  file_type_ = other.file_type_;
+  header_mode_ = other.header_mode_;
+  sample_size_ = other.sample_size_;
+  column_cnt_ = other.column_cnt_;
+  if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator, other.path_, path_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_SUCC(ret) && OB_FAIL(ob_write_string(*allocator, other.format_, format_))) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
 int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
                          const TableItem &other,
                          ObIAllocator* allocator)
@@ -194,6 +211,14 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   } else if (OB_FAIL(part_names_.assign(other.part_names_))) {
   } else if (is_values_table() &&
              OB_FAIL(deep_copy_values_table_def(*other.values_table_def_, expr_copier, allocator))) {
+  } else if (OB_NOT_NULL(other.file_table_def_)) {
+    ObFileTableDef *buf = static_cast<ObFileTableDef*>(allocator->alloc(sizeof(ObFileTableDef)));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      file_table_def_ = new(buf) ObFileTableDef();
+      ret = file_table_def_->deep_copy(expr_copier, *other.file_table_def_, allocator);
+    }
   } else { /* do nothing */ }
   if (OB_SUCC(ret)) {
     if (OB_ISNULL(other.sample_info_)) {

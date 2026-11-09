@@ -2241,6 +2241,13 @@ int ObLogPlan::allocate_function_table_path(FunctionTablePath *func_table_path,
     op->set_table_id(func_table_path->table_id_);
     op->add_values_expr(func_table_path->value_expr_);
     op->set_table_name(table_item->get_table_name());
+    if (OB_NOT_NULL(table_item->file_table_def_)) {
+      const ObFileTableDef *file_def = table_item->file_table_def_;
+      op->set_file_info(file_def->file_type_,
+                        file_def->header_mode_,
+                        file_def->path_,
+                        file_def->describe_mode_);
+    }
     if (OB_FAIL(append(op->get_filter_exprs(), func_table_path->filter_))) {
     } else if (OB_FAIL(op->compute_property(func_table_path))) {
     } else if (OB_FAIL(op->pick_out_startup_filters())) {

@@ -3012,6 +3012,11 @@ int ObBasicSessionInfo::get_ob_ivf_nprobes(uint64_t &ob_ivf_nprobes) const
   return get_uint64_sys_var(SYS_VAR_OB_IVF_NPROBES, ob_ivf_nprobes);
 }
 
+int ObBasicSessionInfo::get_enable_file_sql(bool &enable_file_sql) const
+{
+  return get_bool_sys_var(SYS_VAR_ENABLE_FILE_SQL, enable_file_sql);
+}
+
 
 int ObBasicSessionInfo::get_sql_quote_show_create(bool &sql_quote_show_create) const
 {

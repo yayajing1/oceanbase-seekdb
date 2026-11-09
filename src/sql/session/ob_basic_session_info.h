@@ -445,6 +445,7 @@ public:
   int get_show_ddl_in_compat_mode(bool &show_ddl_in_compat_mode) const;
   int get_ob_hnsw_ef_search(uint64_t &ob_hnsw_ef_search) const;
   int get_ob_ivf_nprobes(uint64_t &ob_ivf_nprobes) const;
+  int get_enable_file_sql(bool &enable_file_sql) const;
   int get_ob_sparse_drop_ratio_search(uint64_t &ob_sparse_drop_ratio_search) const;
   int get_sql_quote_show_create(bool &sql_quote_show_create) const;
   common::ObConsistencyLevel get_consistency_level() const { return consistency_level_; };

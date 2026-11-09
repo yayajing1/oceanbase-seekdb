@@ -1648,6 +1648,13 @@ int ObSelectResolver::expand_target_list(
   } else if (table_item.is_fake_cte_table()) {
     if (OB_FAIL(resolve_all_fake_cte_table_columns(table_item, &column_items))) {
     }
+  } else if (table_item.is_file_table()) {
+    /* the columns of a file table were created by the resolver while the
+       file was inspected, they are stored in the statement */
+    if (OB_ISNULL(get_stmt())
+        || OB_FAIL(get_stmt()->get_column_items(table_item.table_id_, column_items))) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   } else if (table_item.is_function_table()) {
     if (OB_FAIL(resolve_all_function_table_columns(table_item, &column_items))) {
     }

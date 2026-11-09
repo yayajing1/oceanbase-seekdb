@@ -129,6 +129,32 @@ struct ObValuesTableDef {
                        K(access_type_), K(is_const_), K(column_types_));
 };
 
+// Definition of a "file as database" table item, e.g.
+//   select * from read_csv('/tmp/a.csv') t
+// The physical file is scanned by the executor, the columns are inferred
+// from the file content while resolving.
+struct ObFileTableDef
+{
+  ObFileTableDef()
+    : file_type_(0), path_(), format_(), header_mode_(-1), sample_size_(-1),
+      column_cnt_(0), describe_mode_(false) {}
+  // 0: csv, 1: jsonl, 2: parquet, 3: glob
+  int64_t file_type_;
+  common::ObString path_;
+  common::ObString format_;
+  // -1: auto detect header, 0: no header, 1: has header
+  int64_t header_mode_;
+  // only -1 (full scan) is supported by the deterministic inference
+  int64_t sample_size_;
+  // number of columns exposed by the table
+  int64_t column_cnt_;
+  // true when the table is used to answer "DESCRIBE SELECT ..."
+  bool describe_mode_;
+  int deep_copy(ObIRawExprCopier &expr_copier,
+                const ObFileTableDef &other,
+                ObIAllocator *allocator);
+};
+
 struct TableItem
 {
   TableItem()
@@ -156,6 +182,7 @@ struct TableItem
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
     sample_info_ = nullptr;
+    file_table_def_ = nullptr;
   }
 
   virtual TO_STRING_KV(N_TID, table_id_,
@@ -224,6 +251,7 @@ struct TableItem
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
   bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
+  bool is_file_table() const { return file_table_def_ != nullptr; }
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }
   bool is_extended_all_or_user_sys_view() const
@@ -305,6 +333,8 @@ struct TableItem
   ObValuesTableDef *values_table_def_;
   // sample scan infos
   SampleInfo *sample_info_;
+  // file table, e.g. read_csv()/read_json()/read_parquet()/glob()
+  ObFileTableDef *file_table_def_;
 };
 
 struct ColumnItem
