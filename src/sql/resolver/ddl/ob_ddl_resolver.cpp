@@ -2530,8 +2530,11 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
       for (int64_t i = 0; OB_SUCC(ret) && i < ai_refs.count(); ++i) {
         for (int64_t j = 0; OB_SUCC(ret) && j < ai_column_names_.count(); ++j) {
           if (ai_refs.at(i).case_compare_equal(ai_column_names_.at(j))) {
+            /* The default message of OB_NOT_SUPPORTED is "Not supported
+               feature or function", a user error message would replace it. */
             ret = OB_NOT_SUPPORTED;
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "an AI column cannot depend on another AI column");
+            LOG_WARN("an AI column cannot take the result of another AI column",
+                     KR(ret), K(ai_refs.at(i)));
             break;
           }
         }

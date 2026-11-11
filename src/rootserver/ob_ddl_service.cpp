@@ -58,6 +58,8 @@
 #include "rootserver/parallel_ddl/ob_ddl_helper.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
 #include "rootserver/truncate_info/ob_truncate_info_service.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/ob_dml_sql_splicer.h"
 #include "share/truncate_info/ob_truncate_info_util.h"
 #include "storage/tablet/ob_tablet_binding_helper.h"
 #include "rootserver/ob_alter_table_constraint_checker.h"
@@ -8229,6 +8231,81 @@ int ObDDLService::update_prev_id_and_add_column_(
   return ret;
 }
 
+/* Write the metadata of the AI columns that an alter added into the metadata
+ * table of the AI columns.  The definition of an AI column is kept in the
+ * comment of the column, the three hidden columns of the AI column are found
+ * by their names.  An alter that does not add an AI column does not touch the
+ * metadata table at all. */
+static int insert_ai_column_metadata_for_alter(const AlterTableSchema &alter_table_schema,
+                                                const ObTableSchema &new_table_schema,
+                                                ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator;
+  const char *hidden_prefixes[3] = {share::ObAiColumnDef::AI_STATE_PREFIX,
+                                     share::ObAiColumnDef::AI_REQUEST_PREFIX,
+                                     share::ObAiColumnDef::AI_RESULT_SPEC_PREFIX};
+  ObTableSchema::const_column_iterator it_begin = alter_table_schema.column_begin();
+  ObTableSchema::const_column_iterator it_end = alter_table_schema.column_end();
+  for (; OB_SUCC(ret) && it_begin != it_end; ++it_begin) {
+    const AlterColumnSchema *alter_column_schema = static_cast<const AlterColumnSchema *>(*it_begin);
+    if (OB_ISNULL(alter_column_schema)
+        || OB_DDL_ADD_COLUMN != alter_column_schema->alter_type_) {
+      continue;
+    }
+    const ObString comment = alter_column_schema->get_comment_str();
+    if (!share::ObAiColumnDef::is_ai_column_comment(comment)) {
+      continue;
+    }
+    const ObColumnSchemaV2 *column = new_table_schema.get_column_schema(alter_column_schema->get_column_name_str());
+    if (OB_ISNULL(column)) {
+      continue;
+    }
+    share::ObAiColumnDef ai_def;
+    uint64_t hidden_ids[3] = {OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_ID};
+    if (OB_FAIL(ai_def.parse_marker(allocator, comment))) {
+      ret = OB_ERR_UNEXPECTED;
+      RS_LOG(ERROR, "cannot read the definition of the AI column", KR(ret), K(comment));
+      break;
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < 3; ++j) {
+      ObString hidden_name;
+      const ObColumnSchemaV2 *hidden = NULL;
+      if (OB_FAIL(share::ObAiColumnDef::build_hidden_column_name(allocator,
+                                                                 hidden_prefixes[j],
+                                                                 column->get_column_name_str(),
+                                                                 hidden_name))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (!OB_ISNULL(hidden = new_table_schema.get_column_schema(hidden_name))) {
+        hidden_ids[j] = hidden->get_column_id();
+      }
+    }
+    ObDMLSqlSplicer dml;
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    if (OB_SUCC(ret)
+        && (OB_FAIL(dml.add_pk_column("table_id", new_table_schema.get_table_id()))
+            || OB_FAIL(dml.add_pk_column("column_id", column->get_column_id()))
+            || OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(column->get_column_name_str())))
+            || OB_FAIL(dml.add_column("ai_func_type", ai_def.get_func_type()))
+            || OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(ai_def.get_model_name())))
+            || OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(ai_def.get_normalized_expr())))
+            || OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(ai_def.get_sync_mode())))
+            || OB_FAIL(dml.add_column("max_retries", ai_def.get_max_retries()))
+            || OB_FAIL(dml.add_column("state_column_id", hidden_ids[0]))
+            || OB_FAIL(dml.add_column("request_column_id", hidden_ids[1]))
+            || OB_FAIL(dml.add_column("result_spec_column_id", hidden_ids[2]))
+            || OB_FAIL(dml.add_column("input_columns", ObHexEscapeSqlStr(ai_def.get_input_columns())))
+            || OB_FAIL(dml.splice_insert_sql("oceanbase.__all_ai_column", sql))
+            || OB_FAIL(trans.write(sql.ptr(), affected_rows)))) {
+      ret = OB_ERR_UNEXPECTED;
+      RS_LOG(ERROR, "cannot write the metadata of the AI column", KR(ret),
+             K(column->get_column_name_str()));
+    }
+  }
+  return ret;
+}
+
 int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
                                      const AlterTableSchema &alter_table_schema,
                                      ObTableSchema &new_table_schema,
@@ -8586,6 +8663,13 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
           }
         }
       }
+    }
+
+    /* The AI columns that the alter added are recorded in the metadata table
+       of the AI columns, the hidden columns of them are in the new schema. */
+    if (OB_SUCC(ret)
+        && OB_FAIL(insert_ai_column_metadata_for_alter(alter_table_schema, new_table_schema, trans))) {
+      RS_LOG(ERROR, "cannot write the metadata of the AI columns", KR(ret));
     }
 
     bool is_add_lob = false;

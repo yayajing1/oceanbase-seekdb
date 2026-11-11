@@ -25,6 +25,7 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -43,7 +44,8 @@ ObAlterTableResolver::ObAlterTableResolver(ObResolverParams &params)
       add_or_modify_check_cst_times_(0),
       modify_constraint_times_(0),
       add_not_null_constraint_(false),
-      add_column_cnt_(0)
+      add_column_cnt_(0),
+      ai_columns_collected_(false)
 {
 }
 
@@ -3400,6 +3402,7 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
     SQL_RESV_LOG(WARN, "invalid parse tree!", K(ret));
   } else if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(collect_ai_columns_of_table())) {
   } else {
     AlterColumnSchema alter_column_schema;
     ObColumnResolveStat stat;
@@ -3459,9 +3462,85 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
           }
         }
+
+        /* An AI column owns three hidden columns, they are added together with
+           the AI column itself. */
+        if (OB_SUCC(ret)
+            && share::ObAiColumnDef::is_ai_column_comment(alter_column_schema.get_comment_str())) {
+          if (OB_FAIL(add_ai_column_hidden_columns(alter_column_schema.get_column_name_str()))) {
+            SQL_RESV_LOG(WARN, "cannot add the hidden columns of the AI column", K(ret));
+          }
+        }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+/* The AI columns of the table that is altered are remembered, an AI column is
+   not allowed to take the result of another AI column. */
+int ObAlterTableResolver::collect_ai_columns_of_table()
+{
+  int ret = OB_SUCCESS;
+  if (!ai_columns_collected_) {
+    ai_columns_collected_ = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_schema_->get_column_count(); ++i) {
+      const ObColumnSchemaV2 *column = table_schema_->get_column_schema_by_idx(i);
+      if (OB_ISNULL(column)) {
+        continue;
+      }
+      if (share::ObAiColumnDef::is_ai_column_comment(column->get_comment_str())
+          && OB_FAIL(ai_column_names_.push_back(column->get_column_name_str()))) {
+        SQL_RESV_LOG(WARN, "cannot remember the AI column", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+/* An AI column owns three hidden columns, they hold the state, the request and
+   the result spec of the AI column.  The hidden columns are added after the
+   columns of the user, the column ids stay in order. */
+int ObAlterTableResolver::add_ai_column_hidden_columns(const ObString &ai_column_name)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  const char *hidden_prefixes[3] = {share::ObAiColumnDef::AI_STATE_PREFIX,
+                                     share::ObAiColumnDef::AI_REQUEST_PREFIX,
+                                     share::ObAiColumnDef::AI_RESULT_SPEC_PREFIX};
+  ObCharsetType charset_type = CHARSET_INVALID == table_schema_->get_charset_type()
+                               ? ObCharset::get_default_charset()
+                               : table_schema_->get_charset_type();
+  ObCollationType collation_type = CS_TYPE_INVALID == table_schema_->get_collation_type()
+                                   ? ObCharset::get_default_collation(charset_type)
+                                   : table_schema_->get_collation_type();
+  for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+    ObString hidden_name;
+    AlterColumnSchema hidden_col;
+    hidden_col.reset();
+    if (OB_FAIL(share::ObAiColumnDef::build_hidden_column_name(*allocator_,
+                                                                hidden_prefixes[i],
+                                                                ai_column_name,
+                                                                hidden_name))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_FAIL(hidden_col.set_column_name(hidden_name))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      hidden_col.set_data_type(ObVarcharType);
+      hidden_col.set_data_length(1024);
+      hidden_col.set_data_precision(1024);
+      hidden_col.set_nullable(true);
+      hidden_col.set_is_hidden(true);
+      hidden_col.set_charset_type(charset_type);
+      hidden_col.set_collation_type(collation_type);
+      hidden_col.alter_type_ = OB_DDL_ADD_COLUMN;
+      if (OB_FAIL(alter_table_stmt->add_column(hidden_col))) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "cannot add the hidden column of the AI column", K(ret),
+                     K(hidden_name));
+      }
+    }
   }
   return ret;
 }

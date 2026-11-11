@@ -205,6 +205,13 @@ private:
                                 ObAlterTableStmt &alter_table_stmt);
   int check_semistruct_encoding_type(const ObTableSchema &origin_schema, const ObTableSchema &alter_schema);
 
+  /* The AI columns of the table that is altered are remembered, an AI column
+     is not allowed to take the result of another AI column. */
+  int collect_ai_columns_of_table();
+  /* An AI column owns three hidden columns, they hold the state, the request
+     and the result spec of the AI column. */
+  int add_ai_column_hidden_columns(const common::ObString &ai_column_name);
+
   const share::schema::ObTableSchema *table_schema_;
   const share::schema::ObTableSchema *index_schema_;
 
@@ -213,6 +220,7 @@ private:
   int64_t modify_constraint_times_;
   bool add_not_null_constraint_;
   int64_t add_column_cnt_;
+  bool ai_columns_collected_;
   DISALLOW_COPY_AND_ASSIGN(ObAlterTableResolver);
 };
 

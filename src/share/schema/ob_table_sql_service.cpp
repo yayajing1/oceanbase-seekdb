@@ -21,6 +21,8 @@
 #include "share/schema/ob_constraint.h"
 #include "share/schema/ob_partition_sql_helper.h"
 #include "share/ob_timezone_mgr.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/ob_dml_sql_splicer.h"
 
 namespace oceanbase
 {
@@ -2079,6 +2081,89 @@ int ObTableSqlService::inner_create_sys_table(ObTableSchema &table,
   return ret;
 }
 
+/* Write the metadata of the AI columns of a table into the metadata table of
+ * the AI columns.  The definition of an AI column is kept in the comment of
+ * the column, the three hidden columns of the AI column are found by their
+ * names.  A table without an AI column does not touch the metadata table. */
+static int insert_ai_column_metadata(ObTableSchema &table,
+                                     ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator;
+  const char *hidden_prefixes[3] = {ObAiColumnDef::AI_STATE_PREFIX,
+                                     ObAiColumnDef::AI_REQUEST_PREFIX,
+                                     ObAiColumnDef::AI_RESULT_SPEC_PREFIX};
+  const int64_t column_count = table.get_column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const ObColumnSchemaV2 *column = table.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column)) {
+      continue;
+    }
+    const ObString comment = column->get_comment_str();
+    if (!ObAiColumnDef::is_ai_column_comment(comment)) {
+      continue;
+    }
+    ObAiColumnDef ai_def;
+    uint64_t hidden_ids[3] = {OB_INVALID_ID, OB_INVALID_ID, OB_INVALID_ID};
+    if (OB_FAIL(ai_def.parse_marker(allocator, comment))) {
+      ret = OB_ERR_UNEXPECTED;
+      SHARE_LOG(ERROR, "cannot read the definition of the AI column", KR(ret), K(comment));
+      break;
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < 3; ++j) {
+      ObString hidden_name;
+      const ObColumnSchemaV2 *hidden = NULL;
+      if (OB_FAIL(ObAiColumnDef::build_hidden_column_name(allocator,
+                                                          hidden_prefixes[j],
+                                                          column->get_column_name_str(),
+                                                          hidden_name))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (!OB_ISNULL(hidden = table.get_column_schema(hidden_name))) {
+        hidden_ids[j] = hidden->get_column_id();
+      }
+    }
+    ObDMLSqlSplicer dml;
+    ObSqlString sql;
+    int64_t affected_rows = 0;
+    if (OB_SUCC(ret)
+        && (OB_FAIL(dml.add_pk_column("table_id", table.get_table_id()))
+            || OB_FAIL(dml.add_pk_column("column_id", column->get_column_id()))
+            || OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(column->get_column_name_str())))
+            || OB_FAIL(dml.add_column("ai_func_type", ai_def.get_func_type()))
+            || OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(ai_def.get_model_name())))
+            || OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(ai_def.get_normalized_expr())))
+            || OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(ai_def.get_sync_mode())))
+            || OB_FAIL(dml.add_column("max_retries", ai_def.get_max_retries()))
+            || OB_FAIL(dml.add_column("state_column_id", hidden_ids[0]))
+            || OB_FAIL(dml.add_column("request_column_id", hidden_ids[1]))
+            || OB_FAIL(dml.add_column("result_spec_column_id", hidden_ids[2]))
+            || OB_FAIL(dml.add_column("input_columns", ObHexEscapeSqlStr(ai_def.get_input_columns())))
+            || OB_FAIL(dml.splice_insert_sql("oceanbase.__all_ai_column", sql))
+            || OB_FAIL(sql_client.write(sql.ptr(), affected_rows)))) {
+      ret = OB_ERR_UNEXPECTED;
+      SHARE_LOG(ERROR, "cannot write the metadata of the AI column", KR(ret),
+                K(column->get_column_name_str()));
+    }
+  }
+  return ret;
+}
+
+/* Write the metadata of the AI columns of the tables that are created.  The
+ * hook sits in the common place of the two ways a table is created, the local
+ * management service and the tenant root service both end up here. */
+static int batch_insert_ai_column_metadata(ObIArray<ObTableSchema> &tables,
+                                            ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+    if (OB_FAIL(insert_ai_column_metadata(tables.at(i), sql_client))) {
+      SHARE_LOG(ERROR, "cannot write the metadata of the AI columns", KR(ret),
+                K(tables.at(i).get_table_name_str()));
+    }
+  }
+  return ret;
+}
+
 int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
     common::ObISQLClient &sql_client,
     const common::ObString *ddl_stmt_str,
@@ -2151,6 +2236,8 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
     } else if (FALSE_IT(time_guard.click("insert_all_table"))) {
     } else if (OB_FAIL(batch_add_columns_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_column"))) {
+    } else if (OB_FAIL(batch_insert_ai_column_metadata(tables, sql_client))) {
+    } else if (FALSE_IT(time_guard.click("insert_ai_column_metadata"))) {
     } else if (OB_FAIL(batch_add_constraints_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_cst"))) {
     } else if (OB_FAIL(batch_add_table_part_info(sql_client, tables))) {
