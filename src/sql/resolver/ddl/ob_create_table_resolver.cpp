@@ -22,6 +22,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
 #include "share/ob_server_struct.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/resolver/ddl/ob_vec_index_builder_util.h"
@@ -629,6 +630,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     ObTableSchema &table_schema = create_table_stmt->get_create_table_arg().schema_;
     
     bool has_visible_col = false;
+    ObArray<ObString> ai_column_names;
     bool primary_key_set_in_heap_table = false;
     // Store the column schema after resolve_column_definition in resolved_cols
     // To support generating columns in any order, all column_schema are generated first and then uniformly stored in table_schema
@@ -834,6 +836,13 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             }
           }
 
+          if (OB_SUCC(ret) && stat.is_ai_column_) {
+            /* remember the AI column, the three hidden columns of an AI column
+               are added after the columns of the user */
+            if (OB_FAIL(ai_column_names.push_back(column.get_column_name_str()))) {
+            }
+          }
+
           if (OB_SUCC(ret) && !column.is_invisible_column()) {
             has_visible_col = true;
           }
@@ -881,6 +890,48 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    /* An AI column owns three hidden columns, they hold the state, the request
+       and the result spec of the AI column.  The hidden columns are appended
+       after the columns of the user, the column ids stay in order. */
+    if (OB_SUCC(ret) && ai_column_names.count() > 0) {
+      const char *hidden_prefixes[3] = {share::ObAiColumnDef::AI_STATE_PREFIX,
+                                         share::ObAiColumnDef::AI_REQUEST_PREFIX,
+                                         share::ObAiColumnDef::AI_RESULT_SPEC_PREFIX};
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_names.count(); ++i) {
+        for (int64_t j = 0; OB_SUCC(ret) && j < 3; ++j) {
+          ObString hidden_name;
+          ObColumnSchemaV2 hidden_col;
+          hidden_col.reset();
+          if (OB_FAIL(share::ObAiColumnDef::build_hidden_column_name(*allocator_,
+                                                                      hidden_prefixes[j],
+                                                                      ai_column_names.at(i),
+                                                                      hidden_name))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (OB_FAIL(hidden_col.set_column_name(hidden_name))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            hidden_col.set_column_id(gen_column_id());
+            hidden_col.set_data_type(ObVarcharType);
+            hidden_col.set_data_length(1024);
+            hidden_col.set_data_precision(1024);
+            hidden_col.set_nullable(true);
+            hidden_col.set_is_hidden(true);
+            /* the hidden column holds the state of the AI column, it uses the
+               charset of the table */
+            hidden_col.set_charset_type(CHARSET_INVALID == charset_type_
+                                        ? ObCharset::get_default_charset()
+                                        : charset_type_);
+            hidden_col.set_collation_type(CS_TYPE_INVALID == collation_type_
+                                          ? ObCharset::get_default_collation(ObCharset::get_default_charset())
+                                          : collation_type_);
+            if (OB_FAIL(resolved_cols.push_back(hidden_col))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            }
+          }
+        }
       }
     }
 

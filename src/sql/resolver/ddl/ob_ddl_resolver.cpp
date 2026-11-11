@@ -31,6 +31,7 @@
 #include "query/ddl/ob_dynamic_partition_policy.h"
 #include "share/rc/ob_server_runtime.h"
 #include "share/schema/ob_table_schema.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 #include "sql/engine/expr/ob_obj_cast_runtime.h"
 
 namespace oceanbase
@@ -2407,6 +2408,7 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
   int64_t embed_dim = -1;
   int64_t max_retries = 0;
   const char *sync_mode = NULL;
+  ObArray<ObString> ai_refs;
   if (OB_ISNULL(attr_node) || attr_node->num_child_ != 2
       || OB_ISNULL(expr_list_node = attr_node->children_[0])
       || OB_ISNULL(options_node = attr_node->children_[1])) {
@@ -2523,12 +2525,11 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
 
   /* an AI column is not allowed to take the result of another AI column */
   if (OB_SUCC(ret) && args_node->type_ == T_EXPR_LIST && args_node->num_child_ > 1) {
-    ObArray<ObString> refs;
-    if (OB_FAIL(collect_ai_column_refs(args_node->children_[1], refs))) {
+    if (OB_FAIL(collect_ai_column_refs(args_node->children_[1], ai_refs))) {
     } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < refs.count(); ++i) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_refs.count(); ++i) {
         for (int64_t j = 0; OB_SUCC(ret) && j < ai_column_names_.count(); ++j) {
-          if (refs.at(i).case_compare_equal(ai_column_names_.at(j))) {
+          if (ai_refs.at(i).case_compare_equal(ai_column_names_.at(j))) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "an AI column cannot depend on another AI column");
             break;
@@ -2566,6 +2567,33 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
     SQL_RESV_LOG(INFO, "resolve the AI column",
                  K(column.get_column_name_str()), K(func_name), K(model_name),
                  K(max_retries), K(normalized_expr));
+  }
+
+  /* The definition of the AI column is kept in the comment of the column, the
+     DDL reads it back to fill the metadata table of the AI columns. */
+  if (OB_SUCC(ret)) {
+    ObStringBuffer input_buf(allocator_);
+    for (int64_t i = 0; OB_SUCC(ret) && i < ai_refs.count(); ++i) {
+      if (i > 0 && OB_FAIL(input_buf.append(","))) {
+      } else if (OB_FAIL(input_buf.append(ai_refs.at(i).ptr(), ai_refs.at(i).length()))) {
+      }
+    }
+    share::ObAiColumnDef ai_def;
+    ObString marker;
+    if (OB_SUCC(ret)
+        && OB_FAIL(ai_def.assign(*allocator_,
+                                 func_type,
+                                 ObString(model_name ? strlen(model_name) : 0, model_name),
+                                 ObString(sync_mode ? strlen(sync_mode) : 0, sync_mode),
+                                 max_retries,
+                                 normalized_expr,
+                                 input_buf.string()))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_SUCC(ret) && OB_FAIL(ai_def.build_marker(*allocator_, marker))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else if (OB_SUCC(ret) && OB_FAIL(column.set_comment(marker))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
   }
   return ret;
 }

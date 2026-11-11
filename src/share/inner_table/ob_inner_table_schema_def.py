@@ -2469,6 +2469,60 @@ def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
 
 
+# The metadata of the AI columns of a table.  One row is written for every
+# column that was declared with "AI COLUMN (...)", the row points to the three
+# hidden columns that hold the state, the request and the result spec of the
+# column.
+all_ai_column_def = dict(
+    owner = 'oceanbase-600069',
+    table_name     = '__all_ai_column',
+    table_id       = '1135',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('table_id', 'int'),
+        ('column_id', 'int')
+    ],
+    normal_columns = [
+      ('column_name', 'varchar:128', 'true'),
+      ('ai_func_type', 'int', 'true'),
+      ('model_name', 'varchar:128', 'true'),
+      ('normalized_expr', 'varchar:1024', 'true'),
+      ('sync_mode', 'varchar:16', 'true'),
+      ('max_retries', 'int', 'true'),
+      ('state_column_id', 'int', 'true'),
+      ('request_column_id', 'int', 'true'),
+      ('result_spec_column_id', 'int', 'true'),
+      ('input_columns', 'varchar:512', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_def)
+
+# The tasks that an AI column has to compute.  A task is created when a row
+# of a table with an AI column is written, the worker of the tenant picks the
+# tasks up and fills the result of the AI column.
+all_ai_column_task_def = dict(
+    owner = 'oceanbase-600069',
+    table_name     = '__all_ai_column_task',
+    table_id       = '1136',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('task_id', 'int')
+    ],
+    normal_columns = [
+      ('table_id', 'int', 'true'),
+      ('column_id', 'int', 'true'),
+      ('rowkey_predicate', 'varchar:1024', 'true'),
+      ('eligible_ts', 'timestamp', 'true'),
+      ('state', 'int', 'true'),
+      ('retry_count', 'int', 'true'),
+      ('last_error', 'varchar:1024', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
+
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use actual table names for placeholders
 ################################################################################

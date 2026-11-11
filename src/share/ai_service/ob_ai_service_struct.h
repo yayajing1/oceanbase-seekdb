@@ -106,6 +106,62 @@ private:
   int64_t max_concurrency_;
 };
 
+// The definition of an AI column.
+//
+// A column that was declared with "AI COLUMN (...)" carries its definition in
+// the comment of the column.  The marker at the beginning of the comment tells
+// an AI column apart from an ordinary column, the rest of the comment holds
+// the definition itself:
+//
+//   __ai_column__:<func_type>|<model>|<sync_mode>|<max_retries>|<inputs>|<expr>
+//
+// The definition is needed by the DDL, the metadata table of the AI columns is
+// filled when the table of the column is created.
+class ObAiColumnDef
+{
+public:
+  ObAiColumnDef() : func_type_(0), max_retries_(0) {}
+  int assign(common::ObIAllocator &allocator,
+             int64_t func_type,
+             const common::ObString &model_name,
+             const common::ObString &sync_mode,
+             int64_t max_retries,
+             const common::ObString &normalized_expr,
+             const common::ObString &input_columns);
+  // Build the text that is stored in the comment of the column.
+  int build_marker(common::ObIAllocator &allocator, common::ObString &marker) const;
+  // True when the comment of a column holds the definition of an AI column.
+  static bool is_ai_column_comment(const common::ObString &comment);
+  // Read the definition back from the comment of the column.
+  int parse_marker(common::ObIAllocator &allocator, const common::ObString &comment);
+
+  int64_t get_func_type() const { return func_type_; }
+  int64_t get_max_retries() const { return max_retries_; }
+  const common::ObString &get_model_name() const { return model_name_; }
+  const common::ObString &get_sync_mode() const { return sync_mode_; }
+  const common::ObString &get_normalized_expr() const { return normalized_expr_; }
+  const common::ObString &get_input_columns() const { return input_columns_; }
+
+  // The marker of the comment of an AI column.
+  static const char *const AI_COLUMN_MARKER;
+  // The prefixes of the names of the three hidden columns of an AI column.
+  static const char *const AI_STATE_PREFIX;
+  static const char *const AI_REQUEST_PREFIX;
+  static const char *const AI_RESULT_SPEC_PREFIX;
+  // The name of the hidden column that holds the given part of an AI column.
+  static int build_hidden_column_name(common::ObIAllocator &allocator,
+                                       const char *prefix,
+                                       const common::ObString &ai_column_name,
+                                       common::ObString &hidden_name);
+private:
+  int64_t func_type_;
+  int64_t max_retries_;
+  common::ObString model_name_;
+  common::ObString sync_mode_;
+  common::ObString normalized_expr_;
+  common::ObString input_columns_;
+};
+
 } // namespace share
 } // namespace oceanbase
 

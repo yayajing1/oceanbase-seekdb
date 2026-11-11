@@ -310,5 +310,135 @@ int ObAiServiceModelInfo::check_valid() const
 
 OB_SERIALIZE_MEMBER(ObAiServiceModelInfo, name_, type_, model_name_);
 
+/* ---------------------------------------------------------------------------
+ * The definition of an AI column
+ * ------------------------------------------------------------------------- */
+
+const char *const ObAiColumnDef::AI_COLUMN_MARKER = "__ai_column__:";
+const char *const ObAiColumnDef::AI_STATE_PREFIX = "__ai_state_";
+const char *const ObAiColumnDef::AI_REQUEST_PREFIX = "__ai_request_";
+const char *const ObAiColumnDef::AI_RESULT_SPEC_PREFIX = "__ai_result_spec_";
+
+int ObAiColumnDef::assign(common::ObIAllocator &allocator,
+                           int64_t func_type,
+                           const common::ObString &model_name,
+                           const common::ObString &sync_mode,
+                           int64_t max_retries,
+                           const common::ObString &normalized_expr,
+                           const common::ObString &input_columns)
+{
+  int ret = OB_SUCCESS;
+  func_type_ = func_type;
+  max_retries_ = max_retries;
+  if (OB_FAIL(ob_write_string(allocator, model_name, model_name_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, sync_mode, sync_mode_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, normalized_expr, normalized_expr_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, input_columns, input_columns_))) {
+  }
+  return ret;
+}
+
+int ObAiColumnDef::build_marker(common::ObIAllocator &allocator, common::ObString &marker) const
+{
+  int ret = OB_SUCCESS;
+  ObStringBuffer buf(&allocator);
+  char type_buf[32] = {0};
+  char retry_buf[32] = {0};
+  snprintf(type_buf, sizeof(type_buf) - 1, "%ld", static_cast<long>(func_type_));
+  snprintf(retry_buf, sizeof(retry_buf) - 1, "%ld", static_cast<long>(max_retries_));
+  if (OB_FAIL(buf.append(AI_COLUMN_MARKER))) {
+  } else if (OB_FAIL(buf.append(type_buf))) {
+  } else if (OB_FAIL(buf.append("|"))) {
+  } else if (OB_FAIL(buf.append(model_name_.ptr(), model_name_.length()))) {
+  } else if (OB_FAIL(buf.append("|"))) {
+  } else if (OB_FAIL(buf.append(sync_mode_.ptr(), sync_mode_.length()))) {
+  } else if (OB_FAIL(buf.append("|"))) {
+  } else if (OB_FAIL(buf.append(retry_buf))) {
+  } else if (OB_FAIL(buf.append("|"))) {
+  } else if (OB_FAIL(buf.append(input_columns_.ptr(), input_columns_.length()))) {
+  } else if (OB_FAIL(buf.append("|"))) {
+  } else if (OB_FAIL(buf.append(normalized_expr_.ptr(), normalized_expr_.length()))) {
+  } else {
+    marker = buf.string();
+  }
+  return ret;
+}
+
+bool ObAiColumnDef::is_ai_column_comment(const common::ObString &comment)
+{
+  const int64_t marker_len = strlen(AI_COLUMN_MARKER);
+  return comment.length() > marker_len
+         && 0 == memcmp(comment.ptr(), AI_COLUMN_MARKER, marker_len);
+}
+
+int ObAiColumnDef::parse_marker(common::ObIAllocator &allocator, const common::ObString &comment)
+{
+  int ret = OB_SUCCESS;
+  const int64_t marker_len = strlen(AI_COLUMN_MARKER);
+  if (!is_ai_column_comment(comment)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    /* the text of the definition holds six fields, the last one is the
+       normalized expression and may hold the field separator itself */
+    const char *begin = comment.ptr() + marker_len;
+    const char *end = comment.ptr() + comment.length();
+    const char *fields[5] = {NULL, NULL, NULL, NULL, NULL};
+    int64_t lens[5] = {0, 0, 0, 0, 0};
+    int64_t field = 0;
+    const char *cursor = begin;
+    while (field < 5 && cursor < end) {
+      const char *sep = cursor;
+      while (sep < end && '|' != *sep) {
+        ++sep;
+      }
+      fields[field] = cursor;
+      lens[field] = sep - cursor;
+      ++field;
+      cursor = (sep < end) ? sep + 1 : sep;
+    }
+    if (field < 5 || cursor > end) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      char number_buf[32] = {0};
+      if (lens[0] <= 0 || lens[0] >= sizeof(number_buf)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        memcpy(number_buf, fields[0], lens[0]);
+        func_type_ = strtoll(number_buf, NULL, 10);
+        memset(number_buf, 0, sizeof(number_buf));
+        if (lens[3] <= 0 || lens[3] >= sizeof(number_buf)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          memcpy(number_buf, fields[3], lens[3]);
+          max_retries_ = strtoll(number_buf, NULL, 10);
+          if (OB_FAIL(ob_write_string(allocator, common::ObString(lens[1], fields[1]), model_name_))) {
+          } else if (OB_FAIL(ob_write_string(allocator, common::ObString(lens[2], fields[2]), sync_mode_))) {
+          } else if (OB_FAIL(ob_write_string(allocator, common::ObString(lens[4], fields[4]), input_columns_))) {
+          } else if (OB_FAIL(ob_write_string(allocator,
+                                            common::ObString(end - cursor, cursor),
+                                            normalized_expr_))) {
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnDef::build_hidden_column_name(common::ObIAllocator &allocator,
+                                             const char *prefix,
+                                             const common::ObString &ai_column_name,
+                                             common::ObString &hidden_name)
+{
+  int ret = OB_SUCCESS;
+  ObStringBuffer buf(&allocator);
+  if (OB_FAIL(buf.append(prefix))) {
+  } else if (OB_FAIL(buf.append(ai_column_name.ptr(), ai_column_name.length()))) {
+  } else {
+    hidden_name = buf.string();
+  }
+  return ret;
+}
+
 } // namespace share
 } // namespace oceanbase
