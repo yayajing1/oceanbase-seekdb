@@ -53,6 +53,8 @@ static const char *const AI_OPTION_SYNC_MODE = "sync_mode";
 static const char *const AI_OPTION_MAX_RETRIES = "max_retries";
 /* a json column asks the model for one valid json value */
 static const char *const AI_JSON_OUTPUT_CONSTRAINT = " Return exactly one valid JSON value";
+/* an integer column asks the model for one integer */
+static const char *const AI_INTEGER_OUTPUT_CONSTRAINT = " Return a base-10 integer";
 /* the collection type of a vector column */
 static const int32_t AI_COLLECTION_TYPE_VECTOR = 1;
 
@@ -2543,7 +2545,8 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
   }
 
   /* the normalized expression is the text of the ai function call, a json
-     column asks the model for one valid json value */
+     column asks the model for one valid json value, an integer column asks
+     the model for one integer */
   if (OB_SUCC(ret)) {
     ObStringBuffer buf(allocator_);
     if (OB_ISNULL(expr_node->str_value_)) {
@@ -2551,6 +2554,8 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
     } else if (OB_FAIL(buf.append(expr_node->str_value_, expr_node->str_len_))) {
     } else if (column.is_json()
                && OB_FAIL(buf.append(AI_JSON_OUTPUT_CONSTRAINT))) {
+    } else if (ob_is_integer_type(column.get_data_type())
+               && OB_FAIL(buf.append(AI_INTEGER_OUTPUT_CONSTRAINT))) {
     } else {
       normalized_expr = buf.string();
     }

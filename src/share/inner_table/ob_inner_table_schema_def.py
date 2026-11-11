@@ -2513,6 +2513,7 @@ all_ai_column_task_def = dict(
     normal_columns = [
       ('table_id', 'int', 'true'),
       ('column_id', 'int', 'true'),
+      ('request_id', 'varchar:128', 'true'),
       ('rowkey_predicate', 'varchar:1024', 'true'),
       ('eligible_ts', 'timestamp', 'true'),
       ('state', 'int', 'true'),
