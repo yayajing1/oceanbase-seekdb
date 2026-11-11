@@ -425,6 +425,30 @@ int ObAiColumnDef::parse_marker(common::ObIAllocator &allocator, const common::O
   return ret;
 }
 
+int ObAiColumnDef::get_input_column_names(common::ObIAllocator &allocator,
+                                          common::ObIArray<common::ObString> &input_column_names) const
+{
+  int ret = OB_SUCCESS;
+  const char *cursor = input_columns_.ptr();
+  const char *end = input_columns_.ptr() + input_columns_.length();
+  while (OB_SUCC(ret) && cursor < end) {
+    const char *sep = cursor;
+    while (sep < end && ',' != *sep) {
+      ++sep;
+    }
+    if (sep > cursor) {
+      common::ObString name;
+      if (OB_FAIL(ob_write_string(allocator, common::ObString(sep - cursor, cursor), name))) {
+        break;
+      } else if (OB_FAIL(input_column_names.push_back(name))) {
+        break;
+      }
+    }
+    cursor = (sep < end) ? sep + 1 : sep;
+  }
+  return ret;
+}
+
 int ObAiColumnDef::build_hidden_column_name(common::ObIAllocator &allocator,
                                              const char *prefix,
                                              const common::ObString &ai_column_name,

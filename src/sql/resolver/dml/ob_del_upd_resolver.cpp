@@ -24,6 +24,7 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -55,6 +56,53 @@ int ObTableAssignment::expand_expr(ObRawExprFactory &expr_factory,
   return ret;
 }
 
+
+/* An AI column takes the result of an ai function that reads the other columns
+   of the same row.  When a statement writes one of those columns, the result
+   of the AI column is not valid any more and it is set to null, the worker
+   computes it again.  A statement that writes an unrelated column keeps the
+   result of the AI column. */
+static bool is_ai_column_invalidated(const ObTableSchema &table_schema,
+                                      const ObColumnSchemaV2 &ai_column,
+                                      const ObIArray<ObAssignment> &assignments)
+{
+  bool invalidated = false;
+  int ret = OB_SUCCESS;
+  const ObString comment = ai_column.get_comment_str();
+  if (!ObAiColumnDef::is_ai_column_comment(comment)) {
+    return false;
+  }
+  /* the AI column itself is not a dependency of itself */
+  for (int64_t i = 0; !invalidated && i < assignments.count(); ++i) {
+    const ObAssignment &assignment = assignments.at(i);
+    if (OB_NOT_NULL(assignment.column_expr_)
+        && assignment.column_expr_->get_column_id() == ai_column.get_column_id()) {
+      return false;
+    }
+  }
+  ObArenaAllocator allocator;
+  ObAiColumnDef ai_def;
+  ObSEArray<ObString, 4> input_column_names;
+  if (OB_FAIL(ai_def.parse_marker(allocator, comment))) {
+    return false;
+  } else if (OB_FAIL(ai_def.get_input_column_names(allocator, input_column_names))) {
+    return false;
+  }
+  for (int64_t i = 0; !invalidated && i < input_column_names.count(); ++i) {
+    const ObColumnSchemaV2 *input_column = table_schema.get_column_schema(input_column_names.at(i));
+    if (OB_ISNULL(input_column)) {
+      continue;
+    }
+    for (int64_t j = 0; !invalidated && j < assignments.count(); ++j) {
+      const ObAssignment &assignment = assignments.at(j);
+      if (OB_NOT_NULL(assignment.column_expr_)
+          && assignment.column_expr_->get_column_id() == input_column->get_column_id()) {
+        invalidated = true;
+      }
+    }
+  }
+  return invalidated;
+}
 
 ObDelUpdResolver::ObDelUpdResolver(ObResolverParams &params)
   : ObDMLResolver(params),
@@ -523,6 +571,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         ColumnItem *col_item = NULL;
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
+        bool ai_column_invalidated = false;
         uint64_t column_id = OB_INVALID_ID;
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
@@ -534,9 +583,13 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                  trigger_exist,
                                                  *column_schema,
                                                  need_assigned))) {
-        } else if (FALSE_IT(need_assigned = need_assigned || 
+        } else if (FALSE_IT(ai_column_invalidated = (T_UPDATE_SCOPE == scope)
+                                                && is_ai_column_invalidated(*table_schema,
+                                                                            *column_schema,
+                                                                            assigns.at(i).assignments_))) {
+        } else if (FALSE_IT(need_assigned = need_assigned || ai_column_invalidated ||
                                             ((column_schema->is_vec_hnsw_vid_column() ||
-                                              column_schema->is_vec_ivf_center_id_column()) && 
+                                              column_schema->is_vec_ivf_center_id_column()) &&
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
         } else if (need_assigned) {
           // for insert scope, on duplicate key update column list already
@@ -553,7 +606,14 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           } else {
             assignment.column_expr_ = col_item->expr_;
             assignment.is_implicit_ = true;
-            if (column_schema->is_on_update_current_timestamp()) {
+            if (ai_column_invalidated) {
+              /* the result of the AI column is not valid any more, it is set
+                 to null until the worker computes it again */
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_,
+                                                          assignment.expr_))) {
+                ret = OB_ERR_UNEXPECTED;
+              }
+            } else if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);
               if (OB_FAIL(utils.build_now_expr(col_item, assignment.expr_))) {

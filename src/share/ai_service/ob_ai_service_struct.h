@@ -141,6 +141,10 @@ public:
   const common::ObString &get_sync_mode() const { return sync_mode_; }
   const common::ObString &get_normalized_expr() const { return normalized_expr_; }
   const common::ObString &get_input_columns() const { return input_columns_; }
+  // The names of the columns that the ai function of the AI column reads, they
+  // are the dependencies of the AI column.
+  int get_input_column_names(common::ObIAllocator &allocator,
+                              common::ObIArray<common::ObString> &input_column_names) const;
 
   // The marker of the comment of an AI column.
   static const char *const AI_COLUMN_MARKER;
