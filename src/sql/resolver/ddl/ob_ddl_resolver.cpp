@@ -55,8 +55,43 @@ static const char *const AI_OPTION_MAX_RETRIES = "max_retries";
 static const char *const AI_JSON_OUTPUT_CONSTRAINT = " Return exactly one valid JSON value";
 /* an integer column asks the model for one integer */
 static const char *const AI_INTEGER_OUTPUT_CONSTRAINT = " Return a base-10 integer";
+/* the name of the member of the config of an ai function that holds the
+   message of the system role */
+static const char *const AI_CONFIG_SYSTEM_PROMPT = "system_prompt";
 /* the collection type of a vector column */
 static const int32_t AI_COLLECTION_TYPE_VECTOR = 1;
+
+/* The output constraint of an AI column is sent to the model as the message of
+   the system role of the request, the ai function call takes it in the config
+   argument of the call.  The text of the call is the source text of the ai
+   function call, the config argument is added in front of the closing
+   parenthesis of the call. */
+static int build_ai_call_text(ObIAllocator &allocator,
+                               const ObString &call_text,
+                               const char *constraint,
+                               ObString &result)
+{
+  int ret = OB_SUCCESS;
+  ObStringBuffer buf(&allocator);
+  char config_buf[512];
+  const int64_t call_len = call_text.length();
+  int64_t pos = 0;
+  if (OB_ISNULL(constraint)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (call_len < 2 || ')' != call_text.ptr()[call_len - 1]) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    databuff_printf(config_buf, sizeof(config_buf), pos, "{\"%s\":\"%s\"}", AI_CONFIG_SYSTEM_PROMPT, constraint);
+    if (OB_FAIL(buf.append(call_text.ptr(), call_len - 1))) {
+    } else if (OB_FAIL(buf.append(", '"))) {
+    } else if (OB_FAIL(buf.append(config_buf, pos))) {
+    } else if (OB_FAIL(buf.append("')"))) {
+    } else {
+      result = buf.string();
+    }
+  }
+  return ret;
+}
 
 /* collect the columns that an expression of the parse tree refers to */
 static int collect_ai_column_refs(ParseNode *node, ObArray<ObString> &refs)
@@ -2544,20 +2579,38 @@ int ObDDLResolver::resolve_normal_column_attribute_ai_column(ObColumnSchemaV2 &c
     }
   }
 
-  /* the normalized expression is the text of the ai function call, a json
+  /* The normalized expression is the text of the ai function call.  A json
      column asks the model for one valid json value, an integer column asks
-     the model for one integer */
+     the model for one integer, the constraint is the message of the system
+     role of the request. */
   if (OB_SUCC(ret)) {
-    ObStringBuffer buf(allocator_);
+    const char *constraint = NULL;
+    ObString call_text;
+    if (AI_FUNC_TYPE_COMPLETE == func_type) {
+      if (column.is_json()) {
+        constraint = AI_JSON_OUTPUT_CONSTRAINT;
+      } else if (ob_is_integer_type(column.get_data_type())) {
+        constraint = AI_INTEGER_OUTPUT_CONSTRAINT;
+      }
+    }
     if (OB_ISNULL(expr_node->str_value_)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(buf.append(expr_node->str_value_, expr_node->str_len_))) {
-    } else if (column.is_json()
-               && OB_FAIL(buf.append(AI_JSON_OUTPUT_CONSTRAINT))) {
-    } else if (ob_is_integer_type(column.get_data_type())
-               && OB_FAIL(buf.append(AI_INTEGER_OUTPUT_CONSTRAINT))) {
+    } else if (!OB_ISNULL(constraint)
+               && args_node->num_child_ > 2) {
+      /* the call brings its own config, the user is in charge of the message
+         of the system role then */
+      LOG_WARN("the ai function call of an AI column brings its own config, "
+               "the output constraint is not added", K(column.get_column_name_str()));
+      call_text = ObString(expr_node->str_len_, expr_node->str_value_);
+    } else if (!OB_ISNULL(constraint)) {
+      if (OB_FAIL(build_ai_call_text(*allocator_, expr_node->str_value_, constraint, call_text))) {
+        ret = OB_ERR_UNEXPECTED;
+      }
     } else {
-      normalized_expr = buf.string();
+      call_text = ObString(expr_node->str_len_, expr_node->str_value_);
+    }
+    if (OB_SUCC(ret)) {
+      normalized_expr = call_text;
     }
   }
 

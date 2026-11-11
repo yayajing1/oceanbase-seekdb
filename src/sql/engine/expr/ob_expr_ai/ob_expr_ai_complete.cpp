@@ -22,10 +22,41 @@
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
 
-namespace oceanbase 
+namespace oceanbase
 {
-namespace sql 
+namespace sql
 {
+
+/* The system prompt of a request is a member of the config of the ai function,
+   it is the message of the system role of the request.  It is not a member of
+   the body of the request, it is taken out of the config before the body is
+   built. */
+static const char *const AI_CONFIG_SYSTEM_PROMPT = "system_prompt";
+
+static int take_system_prompt(ObJsonObject *config, ObString &system_prompt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(config)) {
+    // there is no config, the request does not have a system message
+  } else {
+    ObJsonNode *node = config->get_value(ObString(AI_CONFIG_SYSTEM_PROMPT));
+    if (OB_NOT_NULL(node)) {
+      if (node->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "the system_prompt of an ai function must be a string");
+      } else {
+        ObString value = static_cast<ObJsonString *>(node)->get_str();
+        system_prompt = value;
+      }
+      if (OB_SUCC(ret) && OB_FAIL(config->remove(ObString(AI_CONFIG_SYSTEM_PROMPT)))) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "cannot take the system_prompt out of the config");
+      }
+    }
+  }
+  return ret;
+}
+
 ObExprAIComplete::ObExprAIComplete(common::ObIAllocator &alloc)
     : ObFuncExprOperator(alloc, 
                         T_FUN_SYS_AI_COMPLETE, 
@@ -103,6 +134,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     ObAIFuncExprInfo *info = nullptr;
     ObString model_id = arg_model_id->get_string();
     ObString prompt;
+    ObString system_prompt;
     ObJsonObject *config = nullptr;
     ObString config_str;
     share::ObAiModelEndpointInfo resolved_endpoint;
@@ -133,6 +165,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
       if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
+      } else if (OB_FAIL(take_system_prompt(config, system_prompt))) {
       }
     }
 
@@ -152,7 +185,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     } else {
       ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
       ObString result;
-      if (OB_FAIL(model.call_completion(prompt, config, result))) {
+      if (OB_FAIL(model.call_completion(system_prompt, prompt, config, result))) {
       } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
       }
     }
