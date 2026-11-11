@@ -75,6 +75,13 @@ struct ObColumnResolveStat
     is_set_null_ = false;
     is_set_not_null_ = false;
     is_set_default_value_ = false;
+    is_ai_column_ = false;
+    ai_func_type_ = 0;
+    ai_max_retries_ = 0;
+    ai_embed_dim_ = -1;
+    ai_sync_mode_ = NULL;
+    ai_model_name_ = NULL;
+    ai_normalized_expr_ = NULL;
   }
   int64_t to_string(char *buf, const int64_t buf_len) const
   {
@@ -86,7 +93,11 @@ struct ObColumnResolveStat
          K(is_set_null_),
          K(is_set_not_null_),
          K(is_set_default_value_),
-         K(is_unique_key_));
+         K(is_unique_key_),
+         K(is_ai_column_),
+         K(ai_func_type_),
+         K(ai_max_retries_),
+         K(ai_embed_dim_));
     J_OBJ_END();
     return pos;
   }
@@ -97,6 +108,15 @@ struct ObColumnResolveStat
   bool is_set_not_null_;
   bool is_set_default_value_;
   bool is_unique_key_;
+  // the definition of an AI column, the strings point into the parse tree and
+  // are valid as long as the statement lives
+  bool is_ai_column_;
+  int64_t ai_func_type_;      // 1: ai_complete, 2: ai_embed
+  int64_t ai_max_retries_;
+  int64_t ai_embed_dim_;      // the dimension of an ai_embed column, -1 if it is not given
+  const char *ai_sync_mode_;
+  const char *ai_model_name_;
+  const char *ai_normalized_expr_;
 };
 
 struct ObDefaultValueRes
@@ -531,11 +551,16 @@ protected:
                                                   ObColumnResolveStat &resolve_stat);
   int resolve_normal_column_attribute(share::schema::ObColumnSchemaV2 &column,
                                       ParseNode *attrs_node,
+                                      ParseNode *type_node,
                                       ObColumnResolveStat &reslove_stat,
                                       common::ObString &pk_name,
                                       bool &is_modify_column,
                                       bool &is_modify_column_visibility,
                                       const bool allow_has_default = true);
+  int resolve_normal_column_attribute_ai_column(share::schema::ObColumnSchemaV2 &column,
+                                                ParseNode *attr_node,
+                                                ParseNode *type_node,
+                                                ObColumnResolveStat &resolve_stat);
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
                                                  ObCreateTableStmt *create_table_stmt);
@@ -858,6 +883,9 @@ protected:
   bool global_;
   common::ObArray<common::ObString> store_column_names_;
   common::ObArray<common::ObString> hidden_store_column_names_;
+  // the names of the AI columns that are already resolved, an AI column is not
+  // allowed to take the result of another AI column as its input
+  common::ObArray<common::ObString> ai_column_names_;
   common::ObSEArray<share::schema::ObColumnNameWrapper, 16, common::ModulePageAllocator, true> sort_column_array_;
   common::hash::ObPlacementHashSet<share::schema::ObColumnNameHashWrapper,
                                    common::OB_MAX_COLUMN_NUMBER> storing_column_set_;

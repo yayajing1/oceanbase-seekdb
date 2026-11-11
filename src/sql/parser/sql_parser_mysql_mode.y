@@ -441,6 +441,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
 %type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> ai_column_expr_list ai_column_expr opt_ai_column_arg_list opt_ai_column_with_option ai_column_option_list ai_column_option
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -6261,6 +6262,86 @@ not NULLX
 | INVISIBLE
 {
   malloc_terminal_node($$, result->malloc_pool_, T_INVISIBLE);
+}
+| AI COLUMN '(' ai_column_expr_list ')' opt_ai_column_with_option
+{
+  ParseNode *expr_list = $4;
+  ParseNode *options = $6;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN, 2, expr_list, options);
+}
+;
+
+/* the AI column definition, the expression list holds the ai function calls
+   that produce the value of the column */
+ai_column_expr_list:
+ai_column_expr
+{
+  malloc_list_node($$, result->malloc_pool_, T_AI_COLUMN_EXPR_LIST, 2, 1, $1);
+}
+| ai_column_expr_list ',' ai_column_expr
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+ai_column_expr:
+NAME_OB '(' opt_ai_column_arg_list ')'
+{
+  ParseNode *func_name = $1;
+  ParseNode *args = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_EXPR, 2, func_name, args);
+  /* the original text of the ai function call is kept, it is the source of
+     the normalized expression of the AI column */
+  dup_expr_string($$, result, @1.first_column, @4.last_column);
+}
+;
+
+opt_ai_column_arg_list:
+/*empty*/
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_ARG_LIST);
+}
+| expr_list
+{
+  $$ = $1;
+}
+;
+
+/* the options of an AI column, such as sync_mode and max_retries */
+opt_ai_column_with_option:
+/*empty*/
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTIONS);
+}
+| WITH '(' ai_column_option_list ')'
+{
+  $$ = $3;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  malloc_list_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION_LIST, 2, 1, $1);
+}
+| ai_column_option_list ',' ai_column_option
+{
+  push_back_list(result->malloc_pool_, result, $$, $1, $3);
+}
+;
+
+ai_column_option:
+NAME_OB COMP_EQ text_string
+{
+  ParseNode *name = $1;
+  ParseNode *value = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, name, value);
+}
+| NAME_OB COMP_EQ INTNUM
+{
+  ParseNode *name = $1;
+  ParseNode *value = $3;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, name, value);
 }
 ;
 
@@ -17528,9 +17609,25 @@ COPY '(' select_stmt ')' TO STRING_VALUE copy_options
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_STMT, 3, $3, $6, $7);
 }
-| COPY relation_name TO STRING_VALUE copy_options
+| COPY tbl_name TO STRING_VALUE copy_options
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_STMT, 3, $2, $4, $5);
+  /* "COPY <table> TO 'file'" is rewritten into "COPY (SELECT * FROM <table>)
+     TO 'file'".  The statement is then resolved as an ordinary select, the
+     copy only changes the target of its result. */
+  ParseNode *star_node = NULL;
+  malloc_terminal_node(star_node, result->malloc_pool_, T_STAR);
+  dup_string_to_node(star_node, result->malloc_pool_, "*");
+  ParseNode *project_node = NULL;
+  malloc_non_terminal_node(project_node, result->malloc_pool_, T_PROJECT_STRING, 1, star_node);
+  ParseNode *project_list = NULL;
+  merge_nodes(project_list, result, T_PROJECT_LIST, project_node);
+  ParseNode *from_list = NULL;
+  merge_nodes(from_list, result, T_FROM_LIST, $2);
+  ParseNode *select_node = NULL;
+  malloc_select_node(select_node, result->malloc_pool_);
+  select_node->children_[PARSE_SELECT_SELECT] = project_list;
+  select_node->children_[PARSE_SELECT_FROM] = from_list;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_STMT, 3, select_node, $4, $5);
 }
 ;
 
@@ -17574,6 +17671,10 @@ relation_name
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $3);
 }
 | relation_name COMP_EQ STRING_VALUE
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $3);
+}
+| relation_name COMP_EQ BOOL_VALUE
 {
   malloc_non_terminal_node($$, result->malloc_pool_, T_COPY_OPTION, 2, $1, $3);
 }

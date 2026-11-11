@@ -24,6 +24,7 @@
 // isolation.  The SQL layer (parser / executor) lives on top of this API.
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -185,6 +186,58 @@ int write_csv_ex(const std::string &path,
                  const std::string &nullstr,
                  bool with_header,
                  bool quote_all);
+
+// ---------------------------------------------------------------------------
+// Streaming CSV writer (used by COPY ... TO 'file')
+// ---------------------------------------------------------------------------
+
+// Streaming counterpart of write_csv().  The escaping rules are the ones of
+// write_csv(), but the rows are written one by one so that a large result set
+// never has to be kept in memory.
+//
+// A NULL field is written as `nullstr`, an empty string is written as an
+// explicitly quoted empty field so that it is not read back as NULL.
+class CsvWriter
+{
+public:
+  CsvWriter();
+  ~CsvWriter();
+  // Open the target file.  `field_sep` is the field separator, a comma by
+  // default, `nullstr` is the text of a NULL field, `quote_cht` is the
+  // character a field is quoted with (a double quote by default) and
+  // `escape_cht` is the character a quote is escaped with (the quote itself
+  // by default, a doubled quote).
+  int open(const std::string &path,
+           const std::string &field_sep,
+           const std::string &nullstr,
+           const std::string &quote_cht = std::string(),
+           const std::string &escape_cht = std::string());
+  // Write the header row, the fields of a header are never NULL.
+  int write_header(const std::vector<std::string> &headers);
+  // Write one row, null_flags[i] != 0 marks the i-th field as NULL.
+  int write_row(const std::vector<std::string> &values, const std::vector<char> &null_flags);
+  int close();
+  bool is_open() const { return fp_ != nullptr; }
+  const std::string &path() const { return path_; }
+
+private:
+  int flush_buffer();
+
+  std::FILE *fp_;
+  std::string path_;
+  std::string separator_;
+  std::string nullstr_;
+  std::string quote_;
+  std::string escape_;
+  std::string buffer_;
+};
+
+// True when the given path names an existing regular file.
+bool file_exists(const std::string &path);
+// Rename `from` to `to`.  An existing `to` is replaced.
+int rename_file(const std::string &from, const std::string &to);
+// Remove the given file, a missing file is not an error.
+int remove_file(const std::string &path);
 
 // Parquet reader restricted to the given columns.  Columns that are not
 // selected are not decoded at all (column pruning).

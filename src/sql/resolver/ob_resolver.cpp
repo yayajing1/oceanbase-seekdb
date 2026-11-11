@@ -17,9 +17,12 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_resolver.h"
 #include "lib/utility/ob_smart_call.h"
+#include "lib/charset/ob_charset.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
 #include "sql/resolver/dml/ob_insert_resolver.h"
+#include "sql/resolver/dml/ob_select_resolver.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/dml/ob_update_resolver.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/resolver/tcl/ob_start_trans_resolver.h"
@@ -137,6 +140,166 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   return ret;
 }
 
+/* COPY (query) TO 'file'
+ *
+ * The query of the copy is resolved as a select statement, the select into
+ * item of the statement carries the target path and the csv options.  The
+ * select into operator of the executor writes the rows to the file.
+ */
+int ObResolver::copy_stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(3 != parse_tree.num_child_)
+      || OB_ISNULL(parse_tree.children_[0])
+      || OB_ISNULL(parse_tree.children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (T_SELECT != parse_tree.children_[0]->type_) {
+    /* the table form is rewritten into a select by the parser */
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(select_stmt_resolver_func<ObSelectResolver>(params,
+                                                                *parse_tree.children_[0],
+                                                                stmt))) {
+  } else if (OB_ISNULL(stmt) || !stmt->is_select_stmt()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = resolve_copy_stmt(params, parse_tree, *static_cast<ObSelectStmt *>(stmt));
+  }
+  return ret;
+}
+
+int ObResolver::resolve_copy_stmt(ObResolverParams &params,
+                                  const ParseNode &parse_tree,
+                                  ObSelectStmt &select_stmt)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *path_node = parse_tree.children_[1];
+  const ParseNode *option_list = parse_tree.children_[2];
+  ObIAllocator *allocator = params.allocator_;
+  ObSelectIntoItem *into_item = NULL;
+  ObString path;
+  ObString nullstr;
+  ObString delimiter;
+  ObString quote;
+  ObString escape;
+  bool with_header = false;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(path_node) || OB_ISNULL(path_node->str_value_) || path_node->str_len_ <= 0) {
+    ret = OB_ERR_PARSE_SQL;
+    LOG_USER_ERROR(OB_ERR_PARSE_SQL, "copy target path");
+  } else {
+    path = ObString(path_node->str_len_, path_node->str_value_);
+  }
+  /* the csv options of the copy */
+  if (OB_SUCC(ret) && OB_NOT_NULL(option_list)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < option_list->num_child_; ++i) {
+      const ParseNode *option = option_list->children_[i];
+      ObString name;
+      ObString value;
+      if (OB_ISNULL(option) || T_COPY_OPTION != option->type_ || option->num_child_ < 1
+          || OB_ISNULL(option->children_[0]) || OB_ISNULL(option->children_[0]->str_value_)) {
+        ret = OB_ERR_UNEXPECTED;
+        break;
+      }
+      name = ObString(option->children_[0]->str_len_, option->children_[0]->str_value_);
+      bool bool_value = true;
+      bool has_bool_value = false;
+      if (option->num_child_ >= 2 && OB_NOT_NULL(option->children_[1])) {
+        const ParseNode *value_node = option->children_[1];
+        if (T_BOOL == value_node->type_) {
+          /* "header = true" and "header = false" */
+          bool_value = (0 != value_node->value_);
+          has_bool_value = true;
+        } else if (OB_NOT_NULL(value_node->str_value_)) {
+          value = ObString(value_node->str_len_, value_node->str_value_);
+        }
+      }
+      if (0 == name.case_compare("format")) {
+        if (0 != value.case_compare("csv")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "copy format");
+        }
+      } else if (0 == name.case_compare("header")) {
+        /* "header" alone means that the header is written, "header = false"
+           asks for a file without a header */
+        with_header = has_bool_value ? bool_value : true;
+      } else if (0 == name.case_compare("nullstr")) {
+        if (value.length() <= 0) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "copy nullstr");
+        } else {
+          nullstr = value;
+        }
+      } else if (0 == name.case_compare("delimiter")) {
+        if (value.length() <= 0) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "copy delimiter");
+        } else {
+          delimiter = value;
+        }
+      } else if (0 == name.case_compare("quote")) {
+        if (value.length() <= 0) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "copy quote");
+        } else {
+          quote = value;
+        }
+      } else if (0 == name.case_compare("escape")) {
+        if (value.length() <= 0) {
+          ret = OB_ERR_PARSE_SQL;
+          LOG_USER_ERROR(OB_ERR_PARSE_SQL, "copy escape");
+        } else {
+          escape = value;
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "copy option");
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    into_item = static_cast<ObSelectIntoItem *>(allocator->alloc(sizeof(ObSelectIntoItem)));
+    if (OB_ISNULL(into_item)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      new(into_item) ObSelectIntoItem();
+      into_item->into_type_ = T_INTO_OUTFILE;
+      into_item->is_copy_ = true;
+      into_item->with_header_ = with_header;
+      /* a copy always writes a single file */
+      into_item->is_single_ = true;
+      into_item->outfile_name_.set_varchar(path);
+      into_item->outfile_name_.set_collation_type(ObCharset::get_system_collation());
+      if (nullstr.length() > 0
+          && OB_FAIL(ob_write_string(*allocator, nullstr, into_item->nullstr_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (delimiter.length() > 0
+                 && OB_FAIL(ob_write_string(*allocator, delimiter, into_item->delimiter_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (quote.length() > 0
+                 && OB_FAIL(ob_write_string(*allocator, quote, into_item->quote_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else if (escape.length() > 0
+                 && OB_FAIL(ob_write_string(*allocator, escape, into_item->escape_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+      /* the header of the file holds the names of the output columns */
+      for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt.get_select_item_size(); ++i) {
+        ObString name;
+        if (OB_FAIL(ob_write_string(*allocator, select_stmt.get_select_item(i).alias_name_, name))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        } else if (OB_FAIL(into_item->header_names_.push_back(name))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        select_stmt.set_select_into(into_item);
+      }
+    }
+  }
+  return ret;
+}
+
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
 #define REGISTER_STMT_RESOLVER(name)                                   \
@@ -165,8 +328,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
 
   if (OB_SUCC(ret)) {
     /* "DESCRIBE SELECT ..." over a file table is answered by a select, the
-       statement is scoped as a plain select */
-    const ObItemType scope_stmt_type = (T_DESCRIBE_SELECT == parse_tree.type_) ? T_SELECT : parse_tree.type_;
+       statement is scoped as a plain select.  "COPY (query) TO 'file'" is a
+       select as well, the copy only adds the target of the result. */
+    const ObItemType scope_stmt_type = (T_DESCRIBE_SELECT == parse_tree.type_
+                                        || T_COPY_STMT == parse_tree.type_)
+                                       ? T_SELECT : parse_tree.type_;
     params_.resolver_scope_stmt_type_ = scope_stmt_type;
     params_.session_info_->set_stmt_type(
       ObResolverUtils::get_stmt_type_by_item_type(scope_stmt_type));
@@ -239,6 +405,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_SELECT: {
         REGISTER_SELECT_STMT_RESOLVER(Select);
+        break;
+      }
+      case T_COPY_STMT: {
+        /* COPY (query) TO 'file', the query is resolved as a select statement */
+        ret = copy_stmt_resolver_func(params_, *real_parse_tree, stmt);
         break;
       }
       case T_DESCRIBE_SELECT: {

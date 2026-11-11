@@ -6837,6 +6837,14 @@ int ObLogPlan::allocate_select_into_as_top(ObLogicalOperator *&old_top)
       select_into->set_escaped_cht(into_item->escaped_cht_);
       select_into->set_cs_type(into_item->cs_type_);
       select_into->set_external_properties(into_item->external_properties_);
+      select_into->set_is_copy(into_item->is_copy_);
+      select_into->set_with_header(into_item->with_header_);
+      select_into->set_nullstr(into_item->nullstr_);
+      select_into->set_delimiter(into_item->delimiter_);
+      select_into->set_quote(into_item->quote_);
+      select_into->set_escape(into_item->escape_);
+      if (OB_SUCC(ret) && OB_FAIL(select_into->set_header_names(into_item->header_names_))) {
+      }
       select_into->set_child(ObLogicalOperator::first_child, old_top);
       // compute property
       if (OB_FAIL(select_into->compute_property())) {

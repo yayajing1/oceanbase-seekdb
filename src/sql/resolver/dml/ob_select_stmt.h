@@ -128,7 +128,14 @@ struct ObSelectIntoItem
         max_file_size_(DEFAULT_MAX_FILE_SIZE),
         escaped_cht_(),
         buffer_size_(DEFAULT_BUFFER_SIZE),
-        external_properties_()
+        external_properties_(),
+        is_copy_(false),
+        with_header_(false),
+        nullstr_(),
+        delimiter_(),
+        quote_(),
+        escape_(),
+        header_names_()
   {
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());
@@ -155,6 +162,13 @@ struct ObSelectIntoItem
     cs_type_ = other.cs_type_;
     buffer_size_ = other.buffer_size_;
     external_properties_ = other.external_properties_;
+    is_copy_ = other.is_copy_;
+    with_header_ = other.with_header_;
+    nullstr_ = other.nullstr_;
+    delimiter_ = other.delimiter_;
+    quote_ = other.quote_;
+    escape_ = other.escape_;
+    header_names_ = other.header_names_;
     return user_vars_.assign(other.user_vars_);
   }
   int deep_copy(ObIAllocator &allocator,
@@ -171,7 +185,13 @@ struct ObSelectIntoItem
                K_(escaped_cht),
                K_(cs_type),
                K_(buffer_size),
-               K_(external_properties));
+               K_(external_properties),
+               K_(is_copy),
+               K_(with_header),
+               K_(nullstr),
+               K_(delimiter),
+               K_(quote),
+               K_(escape));
   ObItemType into_type_;
   common::ObObj outfile_name_;
   common::ObObj field_str_; // field terminated str
@@ -186,6 +206,15 @@ struct ObSelectIntoItem
   common::ObCollationType cs_type_;
   int64_t buffer_size_;
   common::ObString external_properties_;
+  // COPY (query) TO 'file' options.  They are only used when is_copy_ is set,
+  // the ordinary INTO OUTFILE keeps the behaviour of the original statement.
+  bool is_copy_;      // the statement is a COPY ... TO 'file'
+  bool with_header_;  // write the column names as the first row of the file
+  common::ObString nullstr_; // the text a SQL NULL is written as
+  common::ObString delimiter_; // the field separator of the file, a comma by default
+  common::ObString quote_; // the character a field is quoted with, a double quote by default
+  common::ObString escape_; // the character a quote is escaped with, the quote itself by default
+  common::ObSEArray<common::ObString, 16> header_names_; // the column names
 
   static const char* const DEFAULT_FIELD_TERM_STR;
   static const char* const DEFAULT_LINE_TERM_STR;

@@ -22,7 +22,9 @@
 #include "sql/engine/cmd/ob_load_data_parser.h"
 #include "sql/engine/basic/ob_select_into_basic.h"
 #include "sql/engine/basic/ob_external_file_writer.h"
+#include "sql/engine/file_table/file_table_format.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
+#include <string>
 
 namespace oceanbase
 {
@@ -71,7 +73,14 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      is_copy_(false),
+      with_header_(false),
+      nullstr_(),
+      delimiter_(),
+      quote_(),
+      escape_(),
+      header_names_(alloc)
   {
   }
 
@@ -91,6 +100,14 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  // COPY (query) TO 'file' options
+  bool is_copy_;
+  bool with_header_;
+  common::ObString nullstr_;
+  common::ObString delimiter_;
+  common::ObString quote_;
+  common::ObString escape_;
+  common::ObFixedArray<common::ObString, common::ObIAllocator> header_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +143,19 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      is_copy_(false),
+      with_header_(false),
+      nullstr_(),
+      delimiter_(),
+      quote_(),
+      escape_(),
+      copy_target_path_(),
+      copy_temp_path_(),
+      copy_value_buf_(),
+      copy_target_exists_(false),
+      copy_finished_(false),
+      copy_writer_(NULL)
   {
   }
 
@@ -197,6 +226,7 @@ public:
 private:
   int init_env_common();
   int init_csv_env();
+  int init_copy_env();
   void set_csv_format_options();
 
   int get_row_str(const int64_t buf_len, bool is_first_row, char *buf, int64_t &pos);
@@ -256,6 +286,13 @@ private:
   int create_the_only_data_writer(ObExternalFileWriter *&data_writer);
   int new_data_writer(ObExternalFileWriter *&data_writer);
   int check_secure_file_path(ObString file_name);
+  // COPY ... TO 'file' support
+  int init_copy_writer();
+  int copy_write_row();
+  int copy_write_batch(const ObBatchRows &brs);
+  int copy_format_value(const ObObj &obj, std::string &value);
+  int copy_finish(bool success);
+  void copy_cleanup();
   char *get_json_buf() { return json_buf_; }
   int64_t get_json_buf_len() { return json_buf_len_; }
   char *get_shared_buf() { return shared_buf_; }
@@ -292,6 +329,19 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  // COPY (query) TO 'file' state
+  bool is_copy_;
+  bool with_header_;
+  ObString nullstr_;
+  ObString delimiter_;
+  ObString quote_;
+  ObString escape_;
+  std::string copy_target_path_;
+  std::string copy_temp_path_;
+  std::string copy_value_buf_;
+  bool copy_target_exists_;
+  bool copy_finished_;
+  file_table::CsvWriter *copy_writer_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

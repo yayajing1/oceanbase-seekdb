@@ -545,20 +545,41 @@ int scan_csv(const std::string &path,
 
 namespace
 {
+// Append one field.  A NULL field is written as the null string, an empty
+// value is written as an explicitly quoted empty field so that it is not read
+// back as NULL.  A value that contains the separator, a quote character, a
+// line break or leading / trailing blanks is quoted, an embedded quote is
+// escaped with the escape character.
 void append_csv_field(std::string &out,
                       const std::string &value,
                       const std::string &separator,
                       const std::string &nullstr,
-                      bool quote_all)
+                      bool quote_all,
+                      bool is_null,
+                      const std::string &quote_cht,
+                      const std::string &escape_cht)
 {
-  if (value.empty()) {
-    // An empty field denotes NULL.
+  if (is_null) {
     out += nullstr;
     return;
   }
+  const char quote_char = quote_cht.empty() ? '"' : quote_cht[0];
+  const char escape_char = escape_cht.empty() ? quote_char : escape_cht[0];
+  if (value.empty()) {
+    out.push_back(quote_char);
+    out.push_back(quote_char);
+    return;
+  }
   bool need_quote = quote_all || value.find(separator) != std::string::npos
-                    || value.find('"') != std::string::npos || value.find('\n') != std::string::npos
+                    || value.find(quote_char) != std::string::npos
+                    || value.find('\n') != std::string::npos
                     || value.find('\r') != std::string::npos;
+  if (!need_quote && escape_char != quote_char
+      && value.find(escape_char) != std::string::npos) {
+    /* the escape character is doubled, the field has to be quoted to survive
+       a round trip */
+    need_quote = true;
+  }
   if (!need_quote) {
     const char first = value[0];
     const char last = value[value.size() - 1];
@@ -570,17 +591,46 @@ void append_csv_field(std::string &out,
     out += value;
     return;
   }
-  out.push_back('"');
+  out.push_back(quote_char);
   for (size_t i = 0; i < value.size(); ++i) {
     const char c = value[i];
-    if (c == '"') {
-      out.push_back('"');
-      out.push_back('"');
+    if (c == quote_char) {
+      if (escape_char == quote_char) {
+        out.push_back(quote_char);
+        out.push_back(quote_char);
+      } else {
+        out.push_back(escape_char);
+        out.push_back(quote_char);
+      }
+    } else if (escape_char != quote_char && c == escape_char) {
+      out.push_back(escape_char);
+      out.push_back(c);
     } else {
       out.push_back(c);
     }
   }
-  out.push_back('"');
+  out.push_back(quote_char);
+}
+
+// Append one row.  The NULL flags of the row are given explicitly, a flag of
+// zero means that the field carries a value.
+void append_csv_row_ex(std::string &out,
+                       const std::vector<std::string> &row,
+                       const std::vector<char> &null_flags,
+                       const std::string &separator,
+                       const std::string &nullstr,
+                       bool quote_all,
+                       const std::string &quote_cht,
+                       const std::string &escape_cht)
+{
+  for (size_t i = 0; i < row.size(); ++i) {
+    if (i > 0) {
+      out += separator;
+    }
+    const bool is_null = (i < null_flags.size()) && (0 != null_flags[i]);
+    append_csv_field(out, row[i], separator, nullstr, quote_all, is_null, quote_cht, escape_cht);
+  }
+  out.push_back('\n');
 }
 
 void append_csv_row(std::string &out,
@@ -589,13 +639,13 @@ void append_csv_row(std::string &out,
                     const std::string &nullstr,
                     bool quote_all)
 {
+  // An empty field of the batch writer denotes NULL.
+  std::vector<char> null_flags(row.size(), 0);
   for (size_t i = 0; i < row.size(); ++i) {
-    if (i > 0) {
-      out += separator;
-    }
-    append_csv_field(out, row[i], separator, nullstr, quote_all);
+    null_flags[i] = row[i].empty() ? 1 : 0;
   }
-  out.push_back('\n');
+  append_csv_row_ex(out, row, null_flags, separator, nullstr, quote_all,
+                    std::string(), std::string());
 }
 }  // namespace
 
@@ -638,6 +688,150 @@ int write_csv(const std::string &path,
               bool with_header)
 {
   return write_csv_ex(path, headers, rows, field_sep, nullstr, with_header, false);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming CSV writer
+// ---------------------------------------------------------------------------
+
+CsvWriter::CsvWriter() : fp_(nullptr) {}
+
+CsvWriter::~CsvWriter() { close(); }
+
+int CsvWriter::open(const std::string &path,
+                    const std::string &field_sep,
+                    const std::string &nullstr,
+                    const std::string &quote_cht,
+                    const std::string &escape_cht)
+{
+  int ret = FILE_TABLE_OK;
+  close();
+  if (path.empty()) {
+    set_last_error("cannot create file: empty path");
+    return FILE_TABLE_ERR_PARAM;
+  }
+  if (nullptr == (fp_ = std::fopen(path.c_str(), "wb"))) {
+    set_last_error("cannot create file: " + path);
+    return FILE_TABLE_ERR_IO;
+  }
+  path_ = path;
+  separator_ = field_sep.empty() ? std::string(",") : field_sep;
+  nullstr_ = nullstr;
+  quote_ = quote_cht.empty() ? std::string("\"") : quote_cht;
+  escape_ = escape_cht.empty() ? quote_ : escape_cht;
+  buffer_.clear();
+  return ret;
+}
+
+int CsvWriter::flush_buffer()
+{
+  int ret = FILE_TABLE_OK;
+  if (!buffer_.empty()) {
+    if (nullptr == fp_) {
+      set_last_error("csv writer is not open");
+      ret = FILE_TABLE_ERR_IO;
+    } else {
+      const size_t written = std::fwrite(buffer_.data(), 1, buffer_.size(), fp_);
+      if (written != buffer_.size()) {
+        set_last_error("cannot write file: " + path_);
+        ret = FILE_TABLE_ERR_IO;
+      }
+      buffer_.clear();
+    }
+  }
+  return ret;
+}
+
+int CsvWriter::write_header(const std::vector<std::string> &headers)
+{
+  int ret = FILE_TABLE_OK;
+  if (nullptr == fp_) {
+    set_last_error("csv writer is not open");
+    return FILE_TABLE_ERR_IO;
+  }
+  std::vector<char> null_flags(headers.size(), 0);
+  append_csv_row_ex(buffer_, headers, null_flags, separator_, nullstr_, false, quote_, escape_);
+  return ret;
+}
+
+int CsvWriter::write_row(const std::vector<std::string> &values, const std::vector<char> &null_flags)
+{
+  int ret = FILE_TABLE_OK;
+  if (nullptr == fp_) {
+    set_last_error("csv writer is not open");
+    return FILE_TABLE_ERR_IO;
+  }
+  append_csv_row_ex(buffer_, values, null_flags, separator_, nullstr_, false, quote_, escape_);
+  return ret;
+}
+
+int CsvWriter::close()
+{
+  int ret = FILE_TABLE_OK;
+  if (nullptr != fp_) {
+    if (FILE_TABLE_OK != flush_buffer()) {
+      ret = FILE_TABLE_ERR_IO;
+    }
+    if (0 != std::fclose(fp_)) {
+      set_last_error("cannot close file: " + path_);
+      ret = FILE_TABLE_ERR_IO;
+    }
+    fp_ = nullptr;
+  }
+  buffer_.clear();
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// File helpers
+// ---------------------------------------------------------------------------
+
+bool file_exists(const std::string &path)
+{
+  if (path.empty()) {
+    return false;
+  }
+  std::FILE *fp = std::fopen(path.c_str(), "rb");
+  if (nullptr == fp) {
+    return false;
+  }
+  std::fclose(fp);
+  return true;
+}
+
+int rename_file(const std::string &from, const std::string &to)
+{
+  if (from.empty() || to.empty()) {
+    set_last_error("cannot rename file: empty path");
+    return FILE_TABLE_ERR_PARAM;
+  }
+  // The target must not be replaced silently, the caller decides whether an
+  // existing target is an error.
+  if (file_exists(to)) {
+    set_last_error("file already exists: " + to);
+    return FILE_TABLE_ERR_IO;
+  }
+  if (0 != std::rename(from.c_str(), to.c_str())) {
+    set_last_error("cannot rename file: " + from + " -> " + to);
+    return FILE_TABLE_ERR_IO;
+  }
+  return FILE_TABLE_OK;
+}
+
+int remove_file(const std::string &path)
+{
+  if (path.empty()) {
+    return FILE_TABLE_OK;
+  }
+  if (0 != std::remove(path.c_str())) {
+    // A file that is already gone is not an error.
+    if (!file_exists(path)) {
+      return FILE_TABLE_OK;
+    }
+    set_last_error("cannot remove file: " + path);
+    return FILE_TABLE_ERR_IO;
+  }
+  return FILE_TABLE_OK;
 }
 
 }  // namespace file_table

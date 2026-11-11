@@ -24,6 +24,7 @@ namespace oceanbase
 namespace sql
 {
 class ObSQLSessionInfo;
+class ObSelectStmt;
 
 /// the interface of this module
 class ObResolver
@@ -47,6 +48,10 @@ private:
 
   template <typename SelectResolverType>
   int select_stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt);
+
+  /* COPY (query) TO 'file' */
+  int copy_stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt);
+  int resolve_copy_stmt(ObResolverParams &params, const ParseNode &parse_tree, ObSelectStmt &select_stmt);
 private:
   // data members
   ObResolverParams params_;

@@ -44,7 +44,14 @@ public:
         escaped_cht_(),
         cs_type_(CS_TYPE_INVALID),
         is_overwrite_(false),
-        external_properties_()
+        external_properties_(),
+        is_copy_(false),
+        with_header_(false),
+        nullstr_(),
+        delimiter_(),
+        quote_(),
+        escape_(),
+        header_names_()
   {
   }
   virtual ~ObLogSelectInto() {}
@@ -107,6 +114,62 @@ public:
   inline void set_external_properties(const common::ObString &external_properties)
   {
     external_properties_.assign_ptr(external_properties.ptr(), external_properties.length());
+  }
+  inline void set_is_copy(bool is_copy)
+  {
+    is_copy_ = is_copy;
+  }
+  inline void set_with_header(bool with_header)
+  {
+    with_header_ = with_header;
+  }
+  inline void set_nullstr(const common::ObString &nullstr)
+  {
+    nullstr_.assign_ptr(nullstr.ptr(), nullstr.length());
+  }
+  inline void set_delimiter(const common::ObString &delimiter)
+  {
+    delimiter_.assign_ptr(delimiter.ptr(), delimiter.length());
+  }
+  inline void set_quote(const common::ObString &quote)
+  {
+    quote_.assign_ptr(quote.ptr(), quote.length());
+  }
+  inline void set_escape(const common::ObString &escape)
+  {
+    escape_.assign_ptr(escape.ptr(), escape.length());
+  }
+  inline int set_header_names(const common::ObIArray<common::ObString> &header_names)
+  {
+    return header_names_.assign(header_names);
+  }
+  inline bool get_is_copy() const
+  {
+    return is_copy_;
+  }
+  inline bool get_with_header() const
+  {
+    return with_header_;
+  }
+  inline common::ObString get_nullstr() const
+  {
+    return nullstr_;
+  }
+  inline common::ObString get_delimiter() const
+  {
+    return delimiter_;
+  }
+  inline common::ObString get_quote() const
+  {
+    return quote_;
+  }
+  inline common::ObString get_escape() const
+  {
+    return escape_;
+  }
+  inline const common::ObIArray<common::ObString> &get_header_names() const
+  {
+    return header_names_;
   }
   inline ObItemType get_into_type() const
   {
@@ -188,6 +251,14 @@ private:
   common::ObCollationType cs_type_;
   bool is_overwrite_;
   common::ObString external_properties_;
+  // COPY (query) TO 'file' options
+  bool is_copy_;
+  bool with_header_;
+  common::ObString nullstr_;
+  common::ObString delimiter_;
+  common::ObString quote_;
+  common::ObString escape_;
+  common::ObSEArray<common::ObString, 16, common::ModulePageAllocator, true> header_names_;
 };
 }
 }
