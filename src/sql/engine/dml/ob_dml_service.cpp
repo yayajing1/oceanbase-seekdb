@@ -34,6 +34,10 @@
 #include "sql/engine/ob_batch_rows.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "lib/time/ob_time_utility.h"
+#include "lib/utility/utility.h"
 namespace oceanbase
 {
 using namespace common;
@@ -2123,6 +2127,10 @@ int ObDMLService::get_nested_delete_ctx(const uint64_t table_id,
   return ret;
 }
 
+/* the tasks of the AI columns of the row that the statement wrote, the
+   implementation is at the end of the file */
+static int handle_ai_column_tasks(ObTableModifyOp &op, ObDMLModifyRowNode &modify_row);
+
 int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_modify_rows, ObTableModifyOp *dml_op)
 {
   int ret = OB_SUCCESS;
@@ -2179,6 +2187,9 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
           } else if (OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
           }
         }
+        // process the tasks of the AI columns
+        if (OB_SUCC(ret) && OB_FAIL(handle_ai_column_tasks(op, modify_row))) {
+        }
       }
     }
 
@@ -2186,6 +2197,429 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
     if (OB_SUCC(ret)) {
       if (dml_op->get_spec().check_fk_batch_ && OB_FAIL(dml_op->perform_batch_fk_check())) {
       } else if (OB_FAIL(!is_iter_end && dml_op->last_store_row_.restore(dml_op->get_child()->get_spec().output_, dml_op->get_eval_ctx()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+/* ---------------------------------------------------------------------------
+ * The tasks of the AI columns
+ *
+ * A row of a table with an AI column needs the result of the ai function of
+ * the column.  The worker of the AI column computes the result, the task of
+ * the task table tells the worker which row has to be computed.  The task is
+ * written in the transaction of the statement that wrote the row, the task is
+ * gone when the statement is rolled back.
+ * ------------------------------------------------------------------------- */
+
+/* the table of the tasks of the AI columns */
+static const char *const AI_COLUMN_TASK_TABLE = "oceanbase.__all_ai_column_task";
+/* a task that waits for the worker */
+static const int64_t AI_COLUMN_TASK_PENDING = 0;
+
+/* An AI column of a table. */
+struct ObAiColumnOfTable
+{
+  uint64_t column_id_;
+  ObString column_name_;
+  ObAiColumnOfTable() : column_id_(OB_INVALID_ID), column_name_() {}
+};
+
+/* The id of a task.  The ids are unique and they increase with the time, the
+   tasks of two rows never share an id. */
+static int64_t next_ai_task_id()
+{
+  static int64_t counter = ObTimeUtility::current_time() * 1000;
+  return ATOMIC_FAA(&counter, 1);
+}
+
+/* The id of the request that groups the tasks of the AI columns of one row.
+   The worker of the AI column computes the tasks of one request together, the
+   results of the AI columns of the row become visible at the same time. */
+static int gen_ai_request_id(char *buf, const int64_t buf_len)
+{
+  static int64_t counter = 0;
+  const int64_t seq = ATOMIC_FAA(&counter, 1);
+  const int len = snprintf(buf, buf_len, "%lld-%lld",
+                           static_cast<long long>(ObTimeUtility::current_time()),
+                           static_cast<long long>(seq));
+  return (0 < len && len < buf_len) ? OB_SUCCESS : OB_ERR_UNEXPECTED;
+}
+
+/* The AI columns of the table, the definition of an AI column is kept in the
+   comment of the column. */
+static int collect_ai_columns(const ObTableSchema &table_schema,
+                               ObSEArray<ObAiColumnOfTable, 8> &ai_columns)
+{
+  int ret = OB_SUCCESS;
+  const int64_t column_count = table_schema.get_column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema_by_idx(i);
+    if (OB_ISNULL(column)) {
+      continue;
+    }
+    if (!ObAiColumnDef::is_ai_column_comment(column->get_comment_str())) {
+      continue;
+    }
+    ObAiColumnOfTable ai_column;
+    ai_column.column_id_ = column->get_column_id();
+    ai_column.column_name_ = column->get_column_name_str();
+    if (OB_FAIL(ai_columns.push_back(ai_column))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
+  }
+  return ret;
+}
+
+/* The index of the column in the row of the statement.  The ids of the columns
+   of the row are in column_ids_, the row and the ids have the same order. */
+static int find_column_index(const UIntFixedArray &column_ids, const uint64_t column_id)
+{
+  int index = -1;
+  for (int64_t i = 0; index < 0 && i < column_ids.count(); ++i) {
+    if (column_ids.at(i) == column_id) {
+      index = static_cast<int>(i);
+    }
+  }
+  return index;
+}
+
+/* The value of the column as a sql literal. */
+static int append_datum_literal(ObIAllocator &allocator,
+                                 const ObExpr *expr,
+                                 const ObDatum *datum,
+                                 const ObObjPrintParams &print_params,
+                                 ObStringBuffer &buf)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(datum) || datum->is_null()) {
+    ret = OB_FAIL(buf.append("NULL"));
+  } else {
+    ObObj obj;
+    if (OB_FAIL(datum->to_obj(obj, expr->obj_meta_))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      char *literal_buf = NULL;
+      int64_t literal_len = 0;
+      int64_t literal_pos = 0;
+      if (OB_FAIL(obj.print_sql_literal(literal_buf, literal_len, literal_pos,
+                                        allocator, print_params))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(buf.append(literal_buf, literal_pos))) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+  }
+  return ret;
+}
+
+/* The value of a column of the row of a statement.  The value is in the
+   expression of the column, the expression of the column is located on the row
+   of the das. */
+static int get_ai_column_value(ObEvalCtx &eval_ctx,
+                                const ExprFixedArray &row_exprs,
+                                const UIntFixedArray &column_ids,
+                                const uint64_t column_id,
+                                const ObExpr *&expr,
+                                const ObDatum *&datum)
+{
+  int ret = OB_SUCCESS;
+  const int index = find_column_index(column_ids, column_id);
+  if (index < 0 || index >= row_exprs.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the column is not in the row of the statement",
+             K(ret), K(column_id), K(index), K(row_exprs.count()));
+  } else {
+    expr = row_exprs.at(index);
+    ObDatum *eval_datum = NULL;
+    if (OB_FAIL(expr->eval(eval_ctx, eval_datum))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      datum = eval_datum;
+    }
+  }
+  return ret;
+}
+
+/* The values of the row of the statement are in the row of the das, the
+   expressions of the row are located on it.  The update of a row keeps the
+   values of the row in the full row of the das, the expressions of the new row
+   and of the old row share the expressions of the full row, they are located
+   with it. */
+static int locate_ai_row_values(ObTableModifyOp &op, ObDMLModifyRowNode &modify_row)
+{
+  int ret = OB_SUCCESS;
+  const ObDMLBaseCtDef &dml_ctdef = *modify_row.dml_ctdef_;
+  ObEvalCtx &eval_ctx = op.get_eval_ctx();
+  if (OB_NOT_NULL(modify_row.full_row_)) {
+    if (OB_FAIL(modify_row.full_row_->to_expr(dml_ctdef.full_row_, eval_ctx))) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(modify_row.old_row_)) {
+    if (OB_FAIL(modify_row.old_row_->to_expr(dml_ctdef.old_row_, eval_ctx))) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(modify_row.new_row_)) {
+    if (OB_FAIL(modify_row.new_row_->to_expr(dml_ctdef.new_row_, eval_ctx))) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  return ret;
+}
+
+/* The predicate that addresses the row, it holds the primary key of the row.
+   The worker of the AI column uses it to read the row and to write the result
+   of the ai function back to it. */
+static int build_rowkey_predicate(ObIAllocator &allocator,
+                                   const ObTableSchema &table_schema,
+                                   const ExprFixedArray &row_exprs,
+                                   const UIntFixedArray &column_ids,
+                                   ObEvalCtx &eval_ctx,
+                                   const ObObjPrintParams &print_params,
+                                   ObString &predicate)
+{
+  int ret = OB_SUCCESS;
+  ObStringBuffer buf(&allocator);
+  ObSEArray<uint64_t, 4> rowkey_column_ids;
+  if (OB_FAIL(table_schema.get_rowkey_info().get_column_ids(rowkey_column_ids))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (0 == rowkey_column_ids.count()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("a table with an AI column needs a primary key", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_column_ids.count(); ++i) {
+      const uint64_t column_id = rowkey_column_ids.at(i);
+      const ObColumnSchemaV2 *column = table_schema.get_column_schema(column_id);
+      const ObExpr *expr = NULL;
+      const ObDatum *datum = NULL;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(get_ai_column_value(eval_ctx, row_exprs, column_ids,
+                                             column_id, expr, datum))) {
+      } else if (buf.length() > 0 && OB_FAIL(buf.append(" AND "))) {
+      } else if (OB_FAIL(buf.append("`"))) {
+      } else if (OB_FAIL(buf.append(column->get_column_name_str()))) {
+      } else if (OB_FAIL(buf.append("` = "))) {
+      } else if (OB_FAIL(append_datum_literal(allocator, expr, datum, print_params, buf))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      predicate = buf.string();
+    }
+  }
+  return ret;
+}
+
+/* The AI columns whose result is not valid any more.  The resolver sets the
+   result of an AI column to null when one of the columns it reads is written,
+   the assignment of the AI column is an implicit one then. */
+static int collect_invalidated_ai_columns(const ObDMLBaseCtDef &dml_ctdef,
+                                           const ObDmlEventType dml_event,
+                                           const ObSEArray<ObAiColumnOfTable, 8> &ai_columns,
+                                           ObSEArray<ObAiColumnOfTable, 8> &invalidated)
+{
+  int ret = OB_SUCCESS;
+  if (ObDmlEventType::DE_INSERTING == dml_event) {
+    /* a new row needs the result of every AI column */
+    if (OB_FAIL(invalidated.assign(ai_columns))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    }
+  } else if (ObDmlEventType::DE_UPDATING == dml_event) {
+    const ObUpdCtDef *upd_ctdef = static_cast<const ObUpdCtDef *>(&dml_ctdef);
+    const ColContentFixedArray &assign_columns = upd_ctdef->assign_columns_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < assign_columns.count(); ++i) {
+      const ColumnContent &info = assign_columns.at(i);
+      /* only an implicit assignment sets the result of an AI column to null */
+      if (!info.is_implicit_ || info.projector_index_ >= dml_ctdef.column_ids_.count()) {
+        continue;
+      }
+      const uint64_t column_id = dml_ctdef.column_ids_.at(info.projector_index_);
+      for (int64_t j = 0; OB_SUCC(ret) && j < ai_columns.count(); ++j) {
+        if (ai_columns.at(j).column_id_ == column_id) {
+          if (OB_FAIL(invalidated.push_back(ai_columns.at(j)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+/* Run the sql of the task table in the transaction of the statement. */
+static int write_ai_column_tasks(ObTableModifyOp &op, const ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  /* The inner sql runs inside the statement, the statement of the inner sql
+     must not end the statement of the session, that is the job of the outer
+     statement.  The flag tells the sql engine that the inner sql is a nested
+     sql, the same way the foreign key does it. */
+  ObExecContext &exec_ctx = op.get_exec_ctx();
+  const bool is_ai_column_nested = exec_ctx.is_ai_column_nested();
+  exec_ctx.set_is_ai_column_nested(true);
+  if (OB_ISNULL(op.inner_conn_) && OB_FAIL(op.open_inner_conn())) {
+    LOG_WARN("cannot open the connection of the inner sql", K(ret));
+  } else if (OB_FAIL(op.begin_nested_session(false))) {
+    LOG_WARN("cannot begin the nested session of the inner sql", K(ret));
+  } else {
+    ret = op.execute_write(sql.ptr());
+    const int end_ret = op.end_nested_session();
+    if (OB_SUCCESS != end_ret) {
+      LOG_WARN("failed to end nested session", K(end_ret));
+      if (OB_SUCCESS == ret) {
+        ret = end_ret;
+      }
+    }
+  }
+  exec_ctx.set_is_ai_column_nested(is_ai_column_nested);
+  return ret;
+}
+
+/* The tasks of the AI columns of the row that the statement wrote.  A task is
+   created for every AI column whose result is not valid any more, the tasks
+   of one row belong to one request. */
+static int insert_ai_column_tasks(ObTableModifyOp &op,
+                                   const uint64_t table_id,
+                                   const ObSEArray<ObAiColumnOfTable, 8> &invalidated,
+                                   const ObString &rowkey_predicate)
+{
+  int ret = OB_SUCCESS;
+  ObDMLSqlSplicer dml;
+  ObSqlString sql;
+  char request_id_buf[64];
+  int64_t task_count = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < invalidated.count(); ++i) {
+    const ObAiColumnOfTable &ai_column = invalidated.at(i);
+    if (0 == task_count) {
+      if (OB_FAIL(gen_ai_request_id(request_id_buf, sizeof(request_id_buf)))) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(dml.add_pk_column("task_id", next_ai_task_id()))
+          || OB_FAIL(dml.add_column("table_id", static_cast<int64_t>(table_id)))
+          || OB_FAIL(dml.add_column("column_id", static_cast<int64_t>(ai_column.column_id_)))
+          || OB_FAIL(dml.add_column("request_id", ObHexEscapeSqlStr(ObString(request_id_buf))))
+          || OB_FAIL(dml.add_column("rowkey_predicate", ObHexEscapeSqlStr(rowkey_predicate)))
+          || OB_FAIL(dml.add_time_column("eligible_ts", 0))
+          || OB_FAIL(dml.add_column("state", AI_COLUMN_TASK_PENDING))
+          || OB_FAIL(dml.add_column("retry_count", 0))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(dml.finish_row())) {
+        /* the row of the task is complete, the next task starts a new row */
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ++task_count;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && task_count > 0) {
+    if (OB_FAIL(dml.splice_batch_insert_sql(AI_COLUMN_TASK_TABLE, sql))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = write_ai_column_tasks(op, sql);
+    }
+  }
+  return ret;
+}
+
+/* The tasks of the row are gone, the row is gone or the result of the AI
+   columns of the row is not valid any more. */
+static int delete_ai_column_tasks(ObTableModifyOp &op,
+                                   const uint64_t table_id,
+                                   const ObString &rowkey_predicate)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  ObSqlString escaped;
+  if (OB_FAIL(sql_append_hex_escape_str(rowkey_predicate, escaped))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(sql.assign_fmt("DELETE FROM %s WHERE table_id = %ld AND rowkey_predicate = %.*s",
+                                    AI_COLUMN_TASK_TABLE, static_cast<long>(table_id),
+                                    static_cast<int>(strlen(escaped.ptr())), escaped.ptr()))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = write_ai_column_tasks(op, sql);
+  }
+  return ret;
+}
+
+/* The id of the table that the statement writes.  The table id of the das
+   context is the id of the location, it is not set when the location covers
+   the whole table, the index id of the das context is the id of the table
+   itself when the statement writes the primary index. */
+static uint64_t get_dml_table_id(const ObDMLBaseCtDef &dml_ctdef)
+{
+  uint64_t table_id = dml_ctdef.das_base_ctdef_.index_tid_;
+  if (OB_INVALID_ID == table_id) {
+    table_id = dml_ctdef.das_base_ctdef_.table_id_;
+  }
+  return table_id;
+}
+
+/* The tasks of the AI columns of the row that the statement wrote. */
+static int handle_ai_column_tasks(ObTableModifyOp &op, ObDMLModifyRowNode &modify_row)
+{
+  int ret = OB_SUCCESS;
+  const ObDMLBaseCtDef &dml_ctdef = *modify_row.dml_ctdef_;
+  const ObDmlEventType dml_event = modify_row.dml_event_;
+  /* only the dml of the table itself writes the tasks of the AI columns */
+  if (!dml_ctdef.is_primary_index_) {
+    return OB_SUCCESS;
+  }
+  ObIAllocator &allocator = op.get_exec_ctx().get_allocator();
+  ObSQLSessionInfo *session = op.get_exec_ctx().get_my_session();
+  ObSchemaGetterGuard *schema_guard = (OB_ISNULL(session) || OB_ISNULL(op.get_exec_ctx().get_sql_ctx()))
+                                      ? NULL : op.get_exec_ctx().get_sql_ctx()->schema_guard_;
+  const ObTableSchema *table_schema = NULL;
+  ObSEArray<ObAiColumnOfTable, 8> ai_columns;
+  ObSEArray<ObAiColumnOfTable, 8> invalidated;
+  ObString rowkey_predicate;
+  ObString old_rowkey_predicate;
+  const uint64_t table_id = get_dml_table_id(dml_ctdef);
+  const bool is_delete = (ObDmlEventType::DE_DELETING == dml_event);
+  if (OB_ISNULL(schema_guard)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_table_schema(table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_FAIL(collect_ai_columns(*table_schema, ai_columns))) {
+  } else if (ai_columns.count() == 0) {
+    /* the table has no AI column */
+    return OB_SUCCESS;
+  } else {
+    const ExprFixedArray &row_exprs = is_delete ? dml_ctdef.old_row_ : dml_ctdef.new_row_;
+    if (OB_FAIL(locate_ai_row_values(op, modify_row))) {
+    } else if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, row_exprs,
+                                               dml_ctdef.column_ids_, op.get_eval_ctx(),
+                                               op.get_obj_print_params(), rowkey_predicate))) {
+    } else if (is_delete) {
+      ret = delete_ai_column_tasks(op, table_id, rowkey_predicate);
+    } else if (OB_FAIL(collect_invalidated_ai_columns(dml_ctdef, dml_event, ai_columns,
+                                                      invalidated))) {
+    } else if (invalidated.count() > 0) {
+      /* the result of the AI columns is not valid any more, the tasks of the
+         old result are gone, they would compute a result of an old row */
+      if (ObDmlEventType::DE_UPDATING == dml_event) {
+        const ExprFixedArray &old_row_exprs = dml_ctdef.old_row_;
+        if (OB_FAIL(build_rowkey_predicate(allocator, *table_schema, old_row_exprs,
+                                           dml_ctdef.column_ids_, op.get_eval_ctx(),
+                                           op.get_obj_print_params(), old_rowkey_predicate))) {
+        } else if (old_rowkey_predicate.length() != rowkey_predicate.length()
+                   || 0 != memcmp(old_rowkey_predicate.ptr(), rowkey_predicate.ptr(),
+                                  rowkey_predicate.length())) {
+          ret = delete_ai_column_tasks(op, table_id, old_rowkey_predicate);
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ret = delete_ai_column_tasks(op, table_id, rowkey_predicate);
+      }
+      if (OB_SUCC(ret)) {
+        ret = insert_ai_column_tasks(op, table_id, invalidated, rowkey_predicate);
       }
     }
   }
@@ -2218,6 +2652,8 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
+    }
+    if (OB_SUCC(ret) && OB_FAIL(handle_ai_column_tasks(op, modify_row))) {
     }
   }
   return ret;

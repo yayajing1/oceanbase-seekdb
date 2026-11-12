@@ -2508,14 +2508,14 @@ all_ai_column_task_def = dict(
     table_type = 'SYSTEM_TABLE',
     gm_columns = ['gmt_create', 'gmt_modified'],
     rowkey_columns = [
-        ('task_id', 'int')
+        ('task_id', 'bigint')
     ],
     normal_columns = [
       ('table_id', 'int', 'true'),
       ('column_id', 'int', 'true'),
       ('request_id', 'varchar:128', 'true'),
       ('rowkey_predicate', 'varchar:1024', 'true'),
-      ('eligible_ts', 'timestamp', 'true'),
+      ('eligible_ts', 'timestamp:6', 'true'),
       ('state', 'int', 'true'),
       ('retry_count', 'int', 'true'),
       ('last_error', 'varchar:1024', 'true')

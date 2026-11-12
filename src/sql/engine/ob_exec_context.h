@@ -682,6 +682,10 @@ public:
   }
   void set_is_online_stats_gathering(bool v) { is_online_stats_gathering_ = v; }
   bool is_online_stats_gathering() const { return is_online_stats_gathering_; }
+  // The statement writes the tasks of the AI columns with an inner sql, the
+  // inner sql runs inside the statement and has to be treated as a nested sql.
+  void set_is_ai_column_nested(bool v) { is_ai_column_nested_ = v; }
+  bool is_ai_column_nested() const { return is_ai_column_nested_; }
   void set_ddl_idempotent_autoinc_params(const int64_t slice_count,
                                          const int64_t slice_idx,
                                          const int64_t slice_row_idx,
@@ -933,6 +937,8 @@ protected:
   ObUserLoggingCtx user_logging_ctx_;
   // for online stats gathering
   bool is_online_stats_gathering_;
+  // for the inner sql that writes the tasks of the AI columns
+  bool is_ai_column_nested_;
   
   // for calculating idempotent auto increment value in DDL
   bool is_ddl_idempotent_auto_inc_;

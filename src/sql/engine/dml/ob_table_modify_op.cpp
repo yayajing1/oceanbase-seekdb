@@ -21,6 +21,7 @@
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "share/ai_service/ob_ai_service_struct.h"
 
 namespace oceanbase
 {
@@ -623,7 +624,9 @@ ObTableModifyOp::ObTableModifyOp(ObExecContext &ctx,
     execute_single_row_(false),
     dml_modify_rows_(ctx.get_allocator()),
     last_store_row_(),
-    saved_session_(NULL)
+    saved_session_(NULL),
+    ai_column_table_id_(OB_INVALID_ID),
+    has_ai_column_(false)
 {
   obj_print_params_ = CREATE_OBJ_PRINT_PARAM(ctx_.get_my_session());
   obj_print_params_.need_cast_expr_ = true;
@@ -909,6 +912,40 @@ int ObTableModifyOp::calc_single_table_loc()
     }
   }
   return ret;
+}
+
+/* The table of the statement has an AI column.  The tasks of the AI columns
+   are written in the transaction of the statement, the result of the ai
+   function of the column is computed by the worker of the AI column. */
+bool ObTableModifyOp::has_ai_column(const ObDMLBaseCtDef &dml_ctdef)
+{
+  int ret = OB_SUCCESS;
+  uint64_t table_id = dml_ctdef.das_base_ctdef_.index_tid_;
+  if (OB_INVALID_ID == table_id) {
+    table_id = dml_ctdef.das_base_ctdef_.table_id_;
+  }
+  if (ai_column_table_id_ != table_id) {
+    ai_column_table_id_ = table_id;
+    has_ai_column_ = false;
+    ObSQLSessionInfo *session = ctx_.get_my_session();
+    ObSchemaGetterGuard *schema_guard = (OB_ISNULL(session) || OB_ISNULL(ctx_.get_sql_ctx()))
+                                        ? NULL : ctx_.get_sql_ctx()->schema_guard_;
+    const ObTableSchema *table_schema = NULL;
+    if (OB_NOT_NULL(schema_guard)
+        && OB_SUCC(schema_guard->get_table_schema(table_id, table_schema))
+        && OB_NOT_NULL(table_schema)) {
+      const int64_t column_count = table_schema->get_column_count();
+      for (int64_t i = 0; i < column_count; ++i) {
+        const ObColumnSchemaV2 *column = table_schema->get_column_schema_by_idx(i);
+        if (OB_NOT_NULL(column)
+            && ObAiColumnDef::is_ai_column_comment(column->get_comment_str())) {
+          has_ai_column_ = true;
+          break;
+        }
+      }
+    }
+  }
+  return has_ai_column_;
 }
 
 int ObTableModifyOp::open_inner_conn()
