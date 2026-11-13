@@ -353,7 +353,7 @@ END_P SET_VAR DELIMITER
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
-        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
+        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING RETRY REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
@@ -14857,6 +14857,14 @@ DROP CONSTRAINT constraint_name
   (void)($3);
   $$ = NULL;
 }
+/* the retry of the result of an AI column, the result of the column is set to
+   null and the worker of the AI column computes it again */
+| RETRY AI COLUMN column_name opt_where
+{
+  ParseNode *col_name = $4;
+  ParseNode *where_node = $5;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_ALTER_TABLE_RETRY_AI_COLUMN, 2, col_name, where_node);
+}
 ;
 
 algorithm_opt:
@@ -16537,6 +16545,10 @@ NAME_OB
 {
   make_name_node($$, result->malloc_pool_, "replace");
 }
+| RETRY
+{
+  make_name_node($$, result->malloc_pool_, "retry");
+}
 | TRUNCATE
 {
   make_name_node($$, result->malloc_pool_, "truncate");
@@ -18191,6 +18203,7 @@ ACCOUNT
 |       RETURNED_SQLSTATE
 |       RETURNING
 |       RETURNS
+|       RETRY
 |       REVERSE
 |       REWRITE
 |       ROLE

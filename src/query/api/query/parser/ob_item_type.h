@@ -2287,6 +2287,7 @@ typedef enum ObItemType
   T_AI_COLUMN_OPTIONS = 4930,
   T_AI_COLUMN_OPTION = 4931,
   T_AI_COLUMN_OPTION_LIST = 4932,
+  T_ALTER_TABLE_RETRY_AI_COLUMN = 4933,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

@@ -51,6 +51,13 @@ private:
 
   /* COPY (query) TO 'file' */
   int copy_stmt_resolver_func(ObResolverParams &params, const ParseNode &parse_tree, ObStmt *&stmt);
+  /* The retry of the result of an AI column, it is an update of the AI
+     column. */
+  int resolve_ai_column_retry(const ParseNode &parse_tree, ObStmt *&stmt, bool &is_retry);
+  int resolve_ai_column_retry_update(const ParseNode &parse_tree,
+                                      const ParseNode &retry_node,
+                                      ObStmt *&stmt);
+  int check_ai_column_retry(ObStmt *stmt, const ParseNode *column_name_node);
   int resolve_copy_stmt(ObResolverParams &params, const ParseNode &parse_tree, ObSelectStmt &select_stmt);
 private:
   // data members

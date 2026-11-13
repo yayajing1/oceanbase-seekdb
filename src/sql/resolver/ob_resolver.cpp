@@ -350,8 +350,43 @@ static int collect_ai_columns_of_stmt(ObDMLStmt *stmt,
 {
   int ret = OB_SUCCESS;
   const common::ObIArray<ColumnItem> &column_items = stmt->get_column_items();
+  /* the columns that the statement writes are not read by the statement, the
+     strict read does not check them */
+  common::ObSEArray<uint64_t, 8> written_column_ids;
+  common::ObSEArray<uint64_t, 8> written_table_ids;
+  if (stmt->is_update_stmt()) {
+    ObUpdateStmt *update_stmt = static_cast<ObUpdateStmt *>(stmt);
+    common::ObIArray<ObUpdateTableInfo*> &table_infos = update_stmt->get_update_table_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_infos.count(); ++i) {
+      ObUpdateTableInfo *table_info = table_infos.at(i);
+      if (OB_ISNULL(table_info)) {
+        continue;
+      }
+      ObAssignments &assignments = table_info->assignments_;
+      for (int64_t j = 0; OB_SUCC(ret) && j < assignments.count(); ++j) {
+        ObAssignment &assignment = assignments.at(j);
+        if (!OB_ISNULL(assignment.column_expr_)) {
+          if (OB_FAIL(written_column_ids.push_back(assignment.column_expr_->get_column_id()))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else if (OB_FAIL(written_table_ids.push_back(assignment.column_expr_->get_table_id()))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          }
+        }
+      }
+    }
+  }
   for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
     const ColumnItem &column_item = column_items.at(i);
+    bool is_written = false;
+    for (int64_t j = 0; !is_written && j < written_column_ids.count(); ++j) {
+      if (written_column_ids.at(j) == column_item.column_id_
+          && written_table_ids.at(j) == column_item.table_id_) {
+        is_written = true;
+      }
+    }
+    if (is_written) {
+      continue;
+    }
     /* the id of the table of a column item is the id of the table of the
        statement, the id of the schema of the table is the id of the base
        table item */
@@ -489,6 +524,259 @@ static int check_ai_column_strict_read(ObResolverParams &params, ObStmt *stmt)
   return ret;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * The retry of the result of an AI column
+ *
+ * "alter table t retry ai column c [where expr]" asks the worker of the AI
+ * column to compute the result of the column again.  The statement is an
+ * update of the AI column, the result of the column is set to null and the
+ * worker computes it again.  The status of the column is a pseudo column of
+ * the retry, it is the state of the hidden column of the AI column, the state
+ * tells whether the result of the column is ready or that the computation of
+ * the result failed.
+ * ------------------------------------------------------------------------- */
+
+/* A parse node that the resolver builds.  The nodes live as long as the
+   statement, the allocator of the resolver is the allocator of the result of
+   the statement. */
+static ParseNode *new_retry_parse_node(common::ObIAllocator &allocator,
+                                       const ObItemType type,
+                                       const int32_t num_child)
+{
+  ParseNode *node = static_cast<ParseNode *>(allocator.alloc(sizeof(ParseNode)));
+  if (OB_ISNULL(node)) {
+    return NULL;
+  }
+  MEMSET(node, 0, sizeof(ParseNode));
+  node->type_ = type;
+  node->num_child_ = num_child;
+  if (num_child > 0) {
+    ParseNode **children = static_cast<ParseNode **>(allocator.alloc(num_child * sizeof(ParseNode *)));
+    if (OB_ISNULL(children)) {
+      return NULL;
+    }
+    for (int32_t i = 0; i < num_child; ++i) {
+      children[i] = NULL;
+    }
+    node->children_ = children;
+  }
+  return node;
+}
+
+/* A copy of a string in the allocator of the resolver. */
+static const char *dup_retry_string(common::ObIAllocator &allocator,
+                                    const common::ObString &str)
+{
+  char *buf = static_cast<char *>(allocator.alloc(str.length() + 1));
+  if (OB_ISNULL(buf)) {
+    return NULL;
+  }
+  MEMCPY(buf, str.ptr(), str.length());
+  buf[str.length()] = '\0';
+  return buf;
+}
+
+/* The pseudo column of the status is the state of the AI column, the state is
+   kept in a hidden column of the AI column.  The name of the pseudo column is
+   not quoted, the name of the physical column of the table is quoted. */
+static int replace_retry_status_column(ParseNode *node,
+                                        common::ObIAllocator &allocator,
+                                        const common::ObString &state_column_name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node) || OB_ISNULL(node->children_)) {
+    return OB_SUCCESS;
+  }
+  if (T_COLUMN_REF == node->type_ && 3 == node->num_child_) {
+    ParseNode *col_name = node->children_[2];
+    if (!OB_ISNULL(col_name) && !OB_ISNULL(col_name->str_value_) && !col_name->is_input_quoted_
+        && 6 == col_name->str_len_ && 0 == strncasecmp(col_name->str_value_, "status", 6)) {
+      ParseNode *new_name = new_retry_parse_node(allocator, col_name->type_, 0);
+      const char *name = dup_retry_string(allocator, state_column_name);
+      const char *ref_name = dup_retry_string(allocator, state_column_name);
+      if (OB_ISNULL(new_name) || OB_ISNULL(name) || OB_ISNULL(ref_name)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        new_name->str_value_ = name;
+        new_name->str_len_ = state_column_name.length();
+        node->str_value_ = ref_name;
+        node->str_len_ = state_column_name.length();
+        node->children_[2] = new_name;
+      }
+    }
+  }
+  for (int32_t i = 0; OB_SUCC(ret) && i < node->num_child_; ++i) {
+    if (OB_FAIL(replace_retry_status_column(node->children_[i], allocator, state_column_name))) {
+    }
+  }
+  return ret;
+}
+
+/* The parse tree of the update that the retry is.  The result of the AI column
+   is set to null, the rows that the predicate of the retry selects are the
+   rows that the worker of the AI column computes again. */
+static ParseNode *build_retry_update_node(common::ObIAllocator &allocator,
+                                           const ParseNode *alter_node,
+                                           ParseNode *table_factor,
+                                           ParseNode *column_name_node,
+                                           ParseNode *where_node)
+{
+  ParseNode *update_node = new_retry_parse_node(allocator, T_UPDATE, 11);
+  ParseNode *table_refs = new_retry_parse_node(allocator, T_TABLE_REFERENCES, 1);
+  ParseNode *assign_list = new_retry_parse_node(allocator, T_ASSIGN_LIST, 1);
+  ParseNode *assign_item = new_retry_parse_node(allocator, T_ASSIGN_ITEM, 2);
+  ParseNode *col_ref = new_retry_parse_node(allocator, T_COLUMN_REF, 3);
+  ParseNode *null_expr = new_retry_parse_node(allocator, T_NULL, 0);
+  const common::ObString column_name(column_name_node->str_len_, column_name_node->str_value_);
+  const char *name = dup_retry_string(allocator, column_name);
+  if (OB_ISNULL(update_node) || OB_ISNULL(table_refs) || OB_ISNULL(assign_list)
+      || OB_ISNULL(assign_item) || OB_ISNULL(col_ref) || OB_ISNULL(null_expr)
+      || OB_ISNULL(name)) {
+    return NULL;
+  }
+  col_ref->str_value_ = name;
+  col_ref->str_len_ = column_name.length();
+  col_ref->children_[2] = column_name_node;
+  assign_item->children_[0] = col_ref;
+  assign_item->children_[1] = null_expr;
+  assign_list->children_[0] = assign_item;
+  table_refs->children_[0] = table_factor;
+  update_node->children_[ObUpdateResolver::TABLE] = table_refs;
+  update_node->children_[ObUpdateResolver::UPDATE_LIST] = assign_list;
+  update_node->children_[ObUpdateResolver::WHERE] = where_node;
+  update_node->stmt_loc_ = alter_node->stmt_loc_;
+  return update_node;
+}
+
+
+int ObResolver::resolve_ai_column_retry(const ParseNode &parse_tree,
+                                         ObStmt *&stmt,
+                                         bool &is_retry)
+{
+  int ret = OB_SUCCESS;
+  is_retry = false;
+  ParseNode *action_list = (parse_tree.num_child_ > 1) ? parse_tree.children_[1] : NULL;
+  if (OB_ISNULL(action_list) || OB_ISNULL(action_list->children_)) {
+    return OB_SUCCESS;
+  }
+  ParseNode *retry_node = NULL;
+  int64_t action_count = 0;
+  for (int32_t i = 0; i < action_list->num_child_; ++i) {
+    ParseNode *action = action_list->children_[i];
+    if (OB_ISNULL(action)) {
+      continue;
+    }
+    ++action_count;
+    if (T_ALTER_TABLE_RETRY_AI_COLUMN == action->type_) {
+      retry_node = action;
+    }
+  }
+  if (OB_ISNULL(retry_node)) {
+    /* the statement does not retry an AI column */
+    return OB_SUCCESS;
+  }
+  is_retry = true;
+  /* the retry of an AI column is an update of the AI column */
+  params_.resolver_scope_stmt_type_ = T_UPDATE;
+  params_.session_info_->set_stmt_type(ObResolverUtils::get_stmt_type_by_item_type(T_UPDATE));
+  if (action_count > 1) {
+    /* the retry of an AI column is the only action of the alter table */
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+    ret = OB_NOT_SUPPORTED;
+  } else {
+    ret = resolve_ai_column_retry_update(parse_tree, *retry_node, stmt);
+  }
+  return ret;
+}
+
+int ObResolver::resolve_ai_column_retry_update(const ParseNode &parse_tree,
+                                                const ParseNode &retry_node,
+                                                ObStmt *&stmt)
+{
+  int ret = OB_SUCCESS;
+  common::ObIAllocator &allocator = *params_.allocator_;
+  ParseNode *column_name_node = retry_node.children_[0];
+  ParseNode *where_node = retry_node.children_[1];
+  ParseNode *table_factor = (parse_tree.num_child_ > 0) ? parse_tree.children_[0] : NULL;
+  ParseNode *update_node = NULL;
+  common::ObString state_column_name;
+  if (OB_ISNULL(column_name_node) || OB_ISNULL(column_name_node->str_value_) || OB_ISNULL(table_factor)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObAiColumnDef::build_hidden_column_name(allocator,
+                                                             ObAiColumnDef::AI_STATE_PREFIX,
+                                                             common::ObString(column_name_node->str_len_,
+                                                                              column_name_node->str_value_),
+                                                             state_column_name))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(replace_retry_status_column(where_node, allocator, state_column_name))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(update_node = build_retry_update_node(allocator,
+                                                             &parse_tree,
+                                                             table_factor,
+                                                             column_name_node,
+                                                             where_node))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(stmt_resolver_func<ObUpdateResolver>(params_, *update_node, stmt))) {
+  } else {
+    ret = check_ai_column_retry(stmt, column_name_node);
+  }
+  return ret;
+}
+
+int ObResolver::check_ai_column_retry(ObStmt *stmt, const ParseNode *column_name_node)
+{
+  int ret = OB_SUCCESS;
+  ObUpdateStmt *update_stmt = NULL;
+  const ObTableSchema *table_schema = NULL;
+  const ObColumnSchemaV2 *column_schema = NULL;
+  bool is_ai_column = false;
+  const common::ObString column_name(column_name_node->str_len_, column_name_node->str_value_);
+  if (OB_ISNULL(stmt) || OB_ISNULL(update_stmt = static_cast<ObUpdateStmt *>(stmt))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const TableItem *table_item = NULL;
+    common::ObIArray<TableItem*> &table_items = update_stmt->get_table_items();
+    if (table_items.count() > 0) {
+      table_item = table_items.at(0);
+    }
+    if (OB_ISNULL(table_item)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(params_.schema_checker_->get_table_schema(table_item->ref_id_, table_schema))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      column_schema = table_schema->get_column_schema(column_name);
+      is_ai_column = (!OB_ISNULL(column_schema)
+                      && ObAiColumnDef::is_ai_column_comment(column_schema->get_comment_str()));
+    }
+  }
+  if (OB_SUCC(ret) && !is_ai_column) {
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_SUCC(ret)) {
+    /* the assignment of the AI column is an implicit one, the worker of the AI
+       column computes the result of the column again */
+    common::ObIArray<ObUpdateTableInfo*> &table_infos = update_stmt->get_update_table_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_infos.count(); ++i) {
+      ObUpdateTableInfo *table_info = table_infos.at(i);
+      if (OB_ISNULL(table_info)) {
+        continue;
+      }
+      ObAssignments &assignments = table_info->assignments_;
+      for (int64_t j = 0; OB_SUCC(ret) && j < assignments.count(); ++j) {
+        ObAssignment &assignment = assignments.at(j);
+        if (!OB_ISNULL(assignment.column_expr_)
+            && assignment.column_expr_->get_column_id() == column_schema->get_column_id()) {
+          assignment.is_implicit_ = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
 #define REGISTER_STMT_RESOLVER(name)                                   \
@@ -539,7 +827,11 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_ALTER_TABLE: {
-        REGISTER_STMT_RESOLVER(AlterTable);
+        bool is_ai_column_retry = false;
+        if (OB_FAIL(resolve_ai_column_retry(*real_parse_tree, stmt, is_ai_column_retry))) {
+        } else if (!is_ai_column_retry) {
+          REGISTER_STMT_RESOLVER(AlterTable);
+        }
         break;
       }
       case T_CREATE_INDEX: {
