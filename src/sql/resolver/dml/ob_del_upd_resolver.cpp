@@ -526,6 +526,26 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
       }
     }
   }
+  /* An AI column that is invalidated is written like any other column, the
+     index of the vector of the column must be kept up to date.  Without it the
+     index keeps the vector of the old row and the worker cannot write the new
+     vector back. */
+  if (OB_SUCC(ret) && !update_with_vector_index) {
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && iter != table_schema->column_end() && !update_with_vector_index; ++iter) {
+      const ObColumnSchemaV2 *column_schema = *iter;
+      if (OB_ISNULL(column_schema)
+          || !is_ai_column_invalidated(*table_schema, *column_schema, assigns)) {
+        continue;
+      }
+      if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(*table_schema,
+                                                                   *schema_guard,
+                                                                   column_schema->get_column_id(),
+                                                                   update_with_vector_index,
+                                                                   index_type))) {
+      }
+    }
+  }
   return ret;
 }
 
