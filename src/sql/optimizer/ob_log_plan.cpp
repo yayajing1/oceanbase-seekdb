@@ -12053,6 +12053,21 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
   } else {
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
     tr_info.match_expr_ = match_against;
+    // The accurate relevance score is only needed when it can be observed by the upper
+    // layer. When the match expr is only used as a retrieval filter in the natural
+    // language mode, the matched documents are decided by the inverted index itself,
+    // so the whole bm25 calculation can be skipped.
+    bool need_calc_relevance = true;
+    int tmp_ret = ObTransformUtils::check_need_calc_match_score(get_optimizer_context().get_exec_ctx(),
+                                                                get_stmt(),
+                                                                match_against,
+                                                                match_pred,
+                                                                need_calc_relevance);
+    if (OB_SUCC(tmp_ret)) {
+      tr_info.need_calc_relevance_ = need_calc_relevance;
+    } else {
+      LOG_WARN("failed to check need calc match score", K(tmp_ret));
+    }
     tr_info.pushdown_match_filter_ = match_pred;
     // The mapping table is absent when the data-table rowkey is used as the document ID.
     table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
@@ -12764,6 +12779,8 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
     table_scan->get_text_retrieval_info().topk_offset_expr_ = pushed_offset_expr;
     table_scan->get_text_retrieval_info().sort_key_.expr_ = sort_keys.at(0).expr_;
     table_scan->get_text_retrieval_info().sort_key_.order_type_ = sort_keys.at(0).order_type_;
+    // the match score is used as the sort key, so the accurate relevance score is required
+    table_scan->get_text_retrieval_info().need_calc_relevance_ = true;
     table_scan->get_text_retrieval_info().with_ties_ = (has_multi_sort_keys || is_fetch_with_ties);
     if (OB_FAIL(tmp_sort_keys.push_back(sort_keys.at(0)))) {
     } else if (OB_FAIL(table_scan->set_op_ordering(tmp_sort_keys))) {

@@ -63,7 +63,9 @@ void ObTextTaaTIter::reuse(const bool switch_tablet)
 int ObTextTaaTIter::pre_process()
 {
   int ret = OB_SUCCESS;
-  if (iter_param_->need_project_relevance()) {
+  if (nullptr != iter_param_->relevance_expr_) {
+    // The bm25 parameter estimation is only used by the relevance expression. When the
+    // accurate relevance score is not required, there is no need to estimate it.
     const bool is_first_estimation = !bm25_param_estimator_.is_estimated();
     if (!is_first_estimation) {
       // skip

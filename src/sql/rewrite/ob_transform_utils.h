@@ -2004,7 +2004,32 @@ public:
                                   ObSelectStmt *view_stmt,
                                   ObIArray<ObRawExpr *> &common_exprs,
                                   const ObIArray<ObRawExpr *> *extra_view_exprs = NULL);
+  /**
+   * Judge whether the accurate relevance score of a match against expression is required.
+   * The score is only required when it can be observed by the upper layer, e.g. it is
+   * projected out, it is used as a sort key or it is compared with a non-zero constant.
+   * When the match expr is only used as a retrieval filter in the natural language mode,
+   * the set of the matched documents is decided by the inverted index itself, so the
+   * accurate score is not required and the whole bm25 calculation can be skipped.
+   *
+   * @param[in] match_filter the filter which the match expr is extracted from
+   * @param[out] need_calc whether the accurate relevance score is required
+   */
+  static int check_need_calc_match_score(ObExecContext *exec_ctx,
+                                          const ObDMLStmt *stmt,
+                                          ObMatchFunRawExpr *match_expr,
+                                          ObRawExpr *match_filter,
+                                          bool &need_calc);
 private:
+  /**
+   * Check whether the match against expression is used by any expression besides the
+   * plain retrieval filter, e.g. the select list, the group by exprs, the having exprs,
+   * the order by exprs or the other conditions.
+   */
+  static int check_match_score_used_outside_filter(const ObDMLStmt *stmt,
+                                                    ObRawExpr *match_filter,
+                                                    bool &used);
+  static int inner_check_expr_contain_match_against(const ObRawExpr *expr, bool &contain);
   static int is_scalar_expr(ObRawExpr* expr, bool &is_scalar);
 
   static int check_is_bypass_string_expr(const ObRawExpr *expr,
@@ -2041,8 +2066,8 @@ private:
                                        ObIArray<TableItem*> &right_tables,
                                        ObIArray<ObSEArray<ObRawExpr*, 4>> &new_outer_conds);
   static int inner_check_need_calc_match_score(ObExecContext *exec_ctx,
-                                              ObRawExpr* expr, 
-                                              ObRawExpr* match_expr, 
+                                              ObRawExpr* expr,
+                                              ObRawExpr* match_expr,
                                               bool &need_calc,
                                               ObIArray<ObExprConstraint> &constraints);
   static int check_stmt_can_trans_as_exists(ObSelectStmt *stmt,

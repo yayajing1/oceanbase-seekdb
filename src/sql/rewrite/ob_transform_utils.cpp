@@ -12858,6 +12858,116 @@ int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
   return ret;
 }
 
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObMatchFunRawExpr *match_expr,
+                                                  ObRawExpr *match_filter,
+                                                  bool &need_calc)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (NATURAL_LANGUAGE_MODE != match_expr->get_mode_flag()) {
+    // The boolean mode decides the validity of a document by the relevance score, and
+    // the other modes change the matching semantic, so the accurate score is always needed.
+    need_calc = true;
+  } else if (OB_ISNULL(match_filter)
+             || T_OP_BOOL != match_filter->get_expr_type()
+             || 1 != match_filter->get_param_count()
+             || OB_ISNULL(match_filter->get_param_expr(0))
+             || match_filter->get_param_expr(0) != match_expr) {
+    // The match expr is not only used by the plain retrieval filter, the filter may
+    // compare the score with a constant, so the accurate score is needed.
+    need_calc = true;
+  } else {
+    bool used = false;
+    if (OB_FAIL(check_match_score_used_outside_filter(stmt, match_filter, used))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      // The match expr is only used as a retrieval filter, the matched documents are
+      // decided by the inverted index, so the accurate relevance score is not required.
+      need_calc = used;
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::check_match_score_used_outside_filter(const ObDMLStmt *stmt,
+                                                            ObRawExpr *match_filter,
+                                                            bool &used)
+{
+  int ret = OB_SUCCESS;
+  used = false;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!stmt->is_select_stmt()) {
+    // be conservative for the dml statements
+    used = true;
+  } else {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    // the conditions other than the retrieval filter
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < stmt->get_condition_exprs().count(); ++i) {
+      ObRawExpr *cur_cond = stmt->get_condition_exprs().at(i);
+      if (cur_cond != match_filter
+          && OB_FAIL(inner_check_expr_contain_match_against(cur_cond, used))) {
+      }
+    }
+    // the select items
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_select_item_size(); ++i) {
+      if (OB_FAIL(inner_check_expr_contain_match_against(select_stmt->get_select_item(i).expr_, used))) {
+      }
+    }
+    // the group by exprs
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_group_expr_size(); ++i) {
+      if (OB_FAIL(inner_check_expr_contain_match_against(select_stmt->get_group_exprs().at(i), used))) {
+      }
+    }
+    // the having exprs
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < select_stmt->get_having_expr_size(); ++i) {
+      if (OB_FAIL(inner_check_expr_contain_match_against(select_stmt->get_having_exprs().at(i), used))) {
+      }
+    }
+    // the order by exprs
+    for (int64_t i = 0; OB_SUCC(ret) && !used && i < stmt->get_order_item_size(); ++i) {
+      if (OB_FAIL(inner_check_expr_contain_match_against(stmt->get_order_item(i).expr_, used))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::inner_check_expr_contain_match_against(const ObRawExpr *expr, bool &contain)
+{
+  int ret = OB_SUCCESS;
+  contain = false;
+  if (OB_ISNULL(expr)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (expr->is_match_against_expr()) {
+    contain = true;
+  } else if (expr->is_case_op_expr()) {
+    const ObCaseOpRawExpr *case_expr = static_cast<const ObCaseOpRawExpr *>(expr);
+    for (int64_t i = 0; OB_SUCC(ret) && !contain && i < case_expr->get_when_expr_size(); ++i) {
+      if (OB_FAIL(SMART_CALL(inner_check_expr_contain_match_against(case_expr->get_when_param_expr(i), contain)))) {
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && !contain && i < case_expr->get_then_param_exprs().count(); ++i) {
+      if (OB_FAIL(SMART_CALL(inner_check_expr_contain_match_against(case_expr->get_then_param_exprs().at(i), contain)))) {
+      }
+    }
+    if (OB_SUCC(ret) && !contain && !OB_ISNULL(case_expr->get_default_param_expr())) {
+      if (OB_FAIL(SMART_CALL(inner_check_expr_contain_match_against(case_expr->get_default_param_expr(), contain)))) {
+      }
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !contain && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(inner_check_expr_contain_match_against(expr->get_param_expr(i), contain)))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::check_expr_eq_zero(ObExecContext *ctx,
                                          ObRawExpr *expr, 
                                          bool &eq_zero, 

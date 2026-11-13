@@ -70,7 +70,9 @@ int ObTextDaaTIter::pre_process()
   int ret = OB_SUCCESS;
   if (dim_iters_->count() == 0) {
     ret = OB_ITER_END;
-  } else if (iter_param_->need_project_relevance()) {
+  } else if (nullptr != iter_param_->relevance_expr_) {
+    // The bm25 parameter estimation is only used by the relevance expression. When the
+    // accurate relevance score is not required, there is no need to estimate it.
     if (OB_FAIL(bm25_param_estimator_.do_estimation(*iter_param_->eval_ctx_))) {
     }
   }

@@ -704,7 +704,11 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
         }
-      } else if (is_text_retrieval_scan() && need_text_retrieval_calc_relevance()) {
+      } else if (is_text_retrieval_scan()) {
+        // The match filter is evaluated on the relevance score projected by the text
+        // retrieval scan, so it can never be evaluated by the scan/storage layer
+        // directly. It must always be evaluated above the scan, no matter whether the
+        // accurate relevance score is calculated or not.
         if (OB_FAIL(nonpushdown_filters.push_back(filters.at(i)))) {
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
