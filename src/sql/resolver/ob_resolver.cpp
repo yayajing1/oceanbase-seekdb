@@ -19,6 +19,9 @@
 #include "lib/utility/ob_smart_call.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "share/ai_service/ob_ai_service_struct.h"
+#include "share/system_variable/ob_sys_var_class_type.h"
 #include "sql/resolver/cmd/ob_alter_system_resolver.h"
 #include "sql/resolver/dml/ob_insert_resolver.h"
 #include "sql/resolver/dml/ob_select_resolver.h"
@@ -294,6 +297,192 @@ int ObResolver::resolve_copy_stmt(ObResolverParams &params,
       }
       if (OB_SUCC(ret)) {
         select_stmt.set_select_into(into_item);
+      }
+    }
+  }
+  return ret;
+}
+
+/* An AI column that a statement reads. */
+struct ObAiColumnOfStmt
+{
+  uint64_t table_id_;
+  uint64_t column_id_;
+  common::ObString table_name_;
+  common::ObString database_name_;
+  common::ObString column_name_;
+};
+
+/* The name of the database and the name of the table of a table of the
+   database.  The names are the names of the schema, the name of the database
+   of a table item is empty when the statement does not qualify the name of
+   the table. */
+static int get_ai_column_table_names(ObSchemaChecker *schema_checker,
+                                      const uint64_t table_id,
+                                      common::ObString &database_name,
+                                      common::ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *database_schema = NULL;
+  if (OB_FAIL(schema_checker->get_table_schema(table_id, table_schema))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_checker->get_database_schema(table_schema->get_database_id(),
+                                                         database_schema))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    database_name = database_schema->get_database_name_str();
+    table_name = table_schema->get_table_name();
+  }
+  return ret;
+}
+
+/* The AI columns that the statement and its subqueries read.  The columns of
+   a table that is not a table of the statement belong to another statement,
+   they are not collected here. */
+static int collect_ai_columns_of_stmt(ObDMLStmt *stmt,
+                                       ObSchemaChecker *schema_checker,
+                                       common::ObSEArray<ObAiColumnOfStmt, 8> &ai_columns)
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<ColumnItem> &column_items = stmt->get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+    const ColumnItem &column_item = column_items.at(i);
+    /* the id of the table of a column item is the id of the table of the
+       statement, the id of the schema of the table is the id of the base
+       table item */
+    const TableItem *table_item = stmt->get_table_item_by_id(column_item.table_id_);
+    if (OB_ISNULL(table_item) || !table_item->is_basic_table()) {
+      /* the column belongs to a table of another statement or to a table that
+         has no schema of its own */
+      continue;
+    }
+    const uint64_t table_id = table_item->ref_id_;
+    const share::schema::ObColumnSchemaV2 *column_schema = NULL;
+    if (OB_FAIL(schema_checker->get_column_schema(table_id,
+                                                   column_item.column_id_,
+                                                   column_schema))) {
+      /* the column is not a column of a table of the database, the strict read
+         does not know anything about it */
+      ret = OB_SUCCESS;
+    } else if (!OB_ISNULL(column_schema)
+               && ObAiColumnDef::is_ai_column_comment(column_schema->get_comment_str())) {
+      ObAiColumnOfStmt ai_column;
+      ai_column.table_id_ = table_id;
+      ai_column.column_id_ = column_item.column_id_;
+      ai_column.column_name_ = column_schema->get_column_name_str();
+      if (OB_FAIL(get_ai_column_table_names(schema_checker, table_id,
+                                            ai_column.database_name_,
+                                            ai_column.table_name_))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(ai_columns.push_back(ai_column))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+    }
+  }
+  common::ObArray<ObSelectStmt*> child_stmts;
+  if (OB_SUCC(ret) && OB_FAIL(stmt->get_child_stmts(child_stmts))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < child_stmts.count(); ++i) {
+      if (OB_FAIL(collect_ai_columns_of_stmt(child_stmts.at(i), schema_checker, ai_columns))) {
+      }
+    }
+  }
+  return ret;
+}
+
+/* Whether every row of the table has the result of the AI column.  The check
+   is done for the whole column, the rows that the statement selects do not
+   matter. */
+static int check_ai_column_is_complete(common::ObMySQLProxy *sql_proxy,
+                                       const ObAiColumnOfStmt &ai_column,
+                                       bool &is_complete)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString sql;
+  common::ObMySQLTransaction trans;
+  is_complete = true;
+  if (OB_FAIL(sql.assign_fmt("SELECT 1 FROM `%.*s`.`%.*s` WHERE `%.*s` IS NULL LIMIT 1",
+                              static_cast<int>(ai_column.database_name_.length()),
+                              ai_column.database_name_.ptr(),
+                              static_cast<int>(ai_column.table_name_.length()),
+                              ai_column.table_name_.ptr(),
+                              static_cast<int>(ai_column.column_name_.length()),
+                              ai_column.column_name_.ptr()))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(trans.start(sql_proxy))) {
+  } else {
+    SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+      sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(trans.read(res, sql.ptr()))) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(result->next())) {
+        if (OB_ITER_END == ret) {
+          is_complete = true;
+          ret = OB_SUCCESS;
+        }
+      } else {
+        is_complete = false;
+      }
+      res.reset();
+    }
+    if (trans.is_started()) {
+      const int end_ret = trans.end(OB_SUCC(ret));
+      if (OB_SUCC(ret) && OB_SUCCESS != end_ret) {
+        ret = end_ret;
+      }
+    }
+  }
+  return ret;
+}
+
+/* A statement that reads an AI column whose result is not complete fails when
+   the strict read is on.  The session of the check is another one, the strict
+   read is off in it, the check does not call itself. */
+static int check_ai_column_strict_read(ObResolverParams &params, ObStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  const stmt::StmtType stmt_type = stmt->get_stmt_type();
+  if (stmt::T_SELECT != stmt_type
+      && stmt::T_UPDATE != stmt_type
+      && stmt::T_DELETE != stmt_type) {
+    return OB_SUCCESS;
+  }
+  ObSQLSessionInfo *session = params.session_info_;
+  common::ObObj value;
+  bool strict_read = false;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, value))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    strict_read = (0 != value.get_int());
+  }
+  if (OB_SUCC(ret) && strict_read) {
+    common::ObSEArray<ObAiColumnOfStmt, 8> ai_columns;
+    if (OB_FAIL(collect_ai_columns_of_stmt(static_cast<ObDMLStmt*>(stmt),
+                                            params.schema_checker_,
+                                            ai_columns))) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_columns.count(); ++i) {
+        const ObAiColumnOfStmt &ai_column = ai_columns.at(i);
+        bool is_complete = true;
+        if (OB_FAIL(check_ai_column_is_complete(params.sql_proxy_, ai_column, is_complete))) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (!is_complete) {
+          LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASKS,
+                         static_cast<uint32_t>(ai_column.table_id_),
+                         static_cast<uint32_t>(ai_column.column_id_));
+          ret = OB_AI_COLUMN_UNFINISHED_TASKS;
+        }
       }
     }
   }
@@ -866,6 +1055,8 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
           ddl_arg.ddl_stmt_str_ = params_.query_ctx_->get_sql_stmt();
         }
       }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(params_, stmt))) {
     }
   }  // end if
   return ret;
