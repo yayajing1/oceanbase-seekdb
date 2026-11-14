@@ -60,6 +60,10 @@ public:
   bool iter_end() const;
   bool is_smart() const;
 
+  // the unicode code point of the current character, it is decoded only once
+  // per character by the context and reused by the processors
+  ob_wc_t current_unicode() const { return next_char_unicode_; }
+
   int add_chain(ObIKTokenChain *chain);
   int add_token(const char *fulltext,
                 int64_t offset,
@@ -82,6 +86,7 @@ private:
 
   int64_t cursor_;
   int64_t next_char_len_;
+  ob_wc_t next_char_unicode_;
   ObFTCharUtil::CharType next_char_type_;
 
   uint32_t handle_size_;
@@ -102,6 +107,13 @@ public:
   virtual ~ObIIKProcessor() {}
 
   int process(TokenizeContext &ctx);
+
+  // process the character that the caller has already fetched from the context,
+  // it avoids fetching the same character again for every processor
+  int process(TokenizeContext &ctx,
+             const char *ch,
+             const uint8_t char_len,
+             const ObFTCharUtil::CharType type);
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,

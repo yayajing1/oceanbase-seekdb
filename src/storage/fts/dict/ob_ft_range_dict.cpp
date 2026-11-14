@@ -382,16 +382,30 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+  // The ranges are built from the sorted dictionary words and they do not
+  // overlap each other, so the only range that may contain the word is the
+  // last one whose start word is not greater than the word. A binary search
+  // avoids comparing the word with every range on each dictionary lookup.
+  int64_t low = 0;
+  int64_t high = range_dicts_.size();
+  while (low < high) {
+    const int64_t mid = low + (high - low) / 2;
     if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
+                          range_dicts_[mid].start_.get_word(),
                           single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+        <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  if (low > 0) {
+    const ObFTRange &range = range_dicts_[low - 1];
+    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                          range.end_.get_word(),
+                          single_word)
+        >= 0) {
+      dict = range.dict_;
       found = true;
     }
   }

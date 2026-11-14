@@ -96,6 +96,11 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
 
+  // the character is already decoded by the context, the connector check
+  // reuses the decoded code point instead of decoding the bytes again
+  UNUSED(ch);
+  UNUSED(char_len);
+
   bool is_connector = false;
 
   if (-1 == arabic_start_) {
@@ -110,8 +115,9 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
     arabic_char_cnt_ += arabic_connect_cnt_;
     arabic_char_cnt_++;
     arabic_connect_cnt_ = 0;
-  } else if (OB_FAIL(
-                 ObFTCharUtil::check_num_connector(ctx.collation(), ch, char_len, is_connector))) {
+  } else if (OB_FAIL(ObFTCharUtil::check_num_connector_unicode(ctx.collation(),
+                                                               ctx.current_unicode(),
+                                                               is_connector))) {
   } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
     // only if connector follows  and is followed by an arabic number we count it
     arabic_connect_cnt_++;
@@ -155,6 +161,9 @@ int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
 {
   int ret = OB_SUCCESS;
 
+  UNUSED(ch);
+  UNUSED(char_len);
+
   bool is_mix_char = (ObFTCharUtil::CharType::ARABIC_LETTER == type
                       || ObFTCharUtil::CharType::ENGLISH_LETTER == type);
   if (mix_start_ == -1) {
@@ -168,10 +177,9 @@ int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
     if (is_mix_char) {
       mix_end_ = ctx.get_end_cursor();
       this->mix_char_cnt_++;
-    } else if (OB_FAIL(ObFTCharUtil::check_letter_connector(ctx.collation(),
-                                                            ch,
-                                                            char_len,
-                                                            is_connector))) {
+    } else if (OB_FAIL(ObFTCharUtil::check_letter_connector_unicode(ctx.collation(),
+                                                                     ctx.current_unicode(),
+                                                                     is_connector))) {
     } else if (ObFTCharUtil::CharType::USELESS == type && is_connector) {
       this->mix_end_ = ctx.get_end_cursor();
       this->mix_char_cnt_++;
